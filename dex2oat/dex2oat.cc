@@ -925,10 +925,20 @@ static int dex2oat(int argc, char** argv) {
   bool implicit_so_checks = false;
   bool implicit_suspend_checks = false;
   std::string plugin_loader_path;
+  const char *android_host_out_env = getenv("ANDROID_HOST_OUT");
   if (kIsTargetBuild) {
     plugin_loader_path = "/system";
   } else {
-    plugin_loader_path = getenv("ANDROID_HOST_OUT");
+    if (android_host_out_env == nullptr || strlen(android_host_out_env) == 0) {
+#ifndef ANDROID_HOST_OUT_ENV
+      plugin_loader_path = "./";
+      LOG(INFO) << "dex2oat: Enviroment ANDROID_HOST_OUT should be set first!!";
+#else
+      plugin_loader_path = ANDROID_HOST_OUT_ENV;
+#endif
+    } else {
+      plugin_loader_path = android_host_out_env;
+    }
   }
 
   if (Is64BitInstructionSet(kRuntimeISA)) {
