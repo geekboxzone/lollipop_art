@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "jni_compiler.h"
+
 #include <algorithm>
 #include <memory>
 #include <vector>
@@ -90,6 +92,7 @@ CompiledMethod* ArtJniCompileMethodInternal(CompilerDriver* driver,
 
   // Assembler that holds generated instructions
   std::unique_ptr<Assembler> jni_asm(Assembler::Create(instruction_set));
+  jni_asm->InitializeFrameDescriptionEntry();
 
   // Offsets into data structures
   // TODO: if cross compiling these offsets are for the host not the target
@@ -434,12 +437,19 @@ CompiledMethod* ArtJniCompileMethodInternal(CompilerDriver* driver,
   std::vector<uint8_t> managed_code(cs);
   MemoryRegion code(&managed_code[0], managed_code.size());
   __ FinalizeInstructions(code);
+  jni_asm->FinalizeFrameDescriptionEntry();
+  ArrayRef<const uint8_t> cli_ref;
+  std::vector<uint8_t>* cli_info = jni_asm->GetFrameDescriptionEntry();
+  if (cli_info != nullptr) {
+      cli_ref = ArrayRef<const uint8_t>(*cli_info);
+  }
   return CompiledMethod::SwapAllocCompiledMethod(driver,
                                                  instruction_set,
                                                  ArrayRef<const uint8_t>(managed_code),
                                                  frame_size,
                                                  main_jni_conv->CoreSpillMask(),
-                                                 main_jni_conv->FpSpillMask());
+                            main_jni_conv->FpSpillMask(),
+                            cli_ref);
 }
 
 // Copy a single parameter from the managed to the JNI calling convention
@@ -545,10 +555,9 @@ static void SetNativeParameter(Assembler* jni_asm,
   }
 }
 
-}  // namespace art
-
-extern "C" art::CompiledMethod* ArtQuickJniCompileMethod(art::CompilerDriver* compiler,
-                                                         uint32_t access_flags, uint32_t method_idx,
-                                                         const art::DexFile& dex_file) {
+CompiledMethod* ArtQuickJniCompileMethod(CompilerDriver* compiler, uint32_t access_flags,
+                                         uint32_t method_idx, const DexFile& dex_file) {
   return ArtJniCompileMethodInternal(compiler, access_flags, method_idx, dex_file);
 }
+
+}  // namespace art

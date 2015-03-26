@@ -195,7 +195,54 @@ art_run_tests_dir :=
 define-build-art-run-test :=
 TEST_ART_RUN_TEST_BUILD_RULES :=
 TEST_ART_TIMING_SENSITIVE_RUN_TESTS :=
-TEST_ART_BROKEN_TRACE_RUN_TESTS :=
+
+# Note 116-nodex2oat is not broken per-se it just doesn't (and isn't meant to) work with --prebuild.
+TEST_ART_BROKEN_PREBUILD_RUN_TESTS := \
+  116-nodex2oat
+
+ifneq (,$(filter prebuild,$(PREBUILD_TYPES)))
+  ART_TEST_KNOWN_BROKEN += $(call all-run-test-names,$(TARGET_TYPES),$(RUN_TYPES),prebuild, \
+      $(COMPILER_TYPES),$(RELOCATE_TYPES),$(TRACE_TYPES),$(GC_TYPES),$(JNI_TYPES), \
+      $(IMAGE_TYPES), $(PICTEST_TYPES), $(TEST_ART_BROKEN_PREBUILD_RUN_TESTS), $(ALL_ADDRESS_SIZES))
+endif
+
+TEST_ART_BROKEN_PREBUILD_RUN_TESTS :=
+
+TEST_ART_BROKEN_NO_PREBUILD_TESTS := \
+  117-nopatchoat
+
+ifneq (,$(filter no-prebuild,$(PREBUILD_TYPES)))
+  ART_TEST_KNOWN_BROKEN += $(call all-run-test-names,$(TARGET_TYPES),$(RUN_TYPES),no-prebuild, \
+      $(COMPILER_TYPES),$(RELOCATE_TYPES),$(TRACE_TYPES),$(GC_TYPES),$(JNI_TYPES), \
+      $(IMAGE_TYPES), $(PICTEST_TYPES), $(TEST_ART_BROKEN_NO_PREBUILD_TESTS), $(ALL_ADDRESS_SIZES))
+endif
+
+TEST_ART_BROKEN_NO_PREBUILD_TESTS :=
+
+# Note 117-nopatchoat is not broken per-se it just doesn't work (and isn't meant to) without
+# --prebuild --relocate
+TEST_ART_BROKEN_NO_RELOCATE_TESTS := \
+  117-nopatchoat
+
+ifneq (,$(filter no-relocate,$(RELOCATE_TYPES)))
+  ART_TEST_KNOWN_BROKEN += $(call all-run-test-names,$(TARGET_TYPES),$(RUN_TYPES),$(PREBUILD_TYPES), \
+      $(COMPILER_TYPES), no-relocate,$(TRACE_TYPES),$(GC_TYPES),$(JNI_TYPES), \
+      $(IMAGE_TYPES), $(PICTEST_TYPES), $(TEST_ART_BROKEN_NO_RELOCATE_TESTS), $(ALL_ADDRESS_SIZES))
+endif
+
+TEST_ART_BROKEN_NO_RELOCATE_TESTS :=
+
+# Tests that are broken with GC stress.
+TEST_ART_BROKEN_GCSTRESS_RUN_TESTS := \
+  004-SignalTest \
+  114-ParallelGC
+
+ifneq (,$(filter gcstress,$(GC_TYPES)))
+  ART_TEST_KNOWN_BROKEN += $(call all-run-test-names,$(TARGET_TYPES),$(RUN_TYPES),$(PREBUILD_TYPES), \
+      $(COMPILER_TYPES),$(RELOCATE_TYPES),$(TRACE_TYPES),gcstress,$(JNI_TYPES), \
+      $(IMAGE_TYPES), $(PICTEST_TYPES), $(TEST_ART_BROKEN_GCSTRESS_RUN_TESTS), $(ALL_ADDRESS_SIZES))
+endif
+
 TEST_ART_BROKEN_GCSTRESS_RUN_TESTS :=
 
 ########################################################################

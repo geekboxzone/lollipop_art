@@ -20,6 +20,7 @@
 
 #include <string>
 
+#include "backend_arm64.h"
 #include "dex/compiler_internals.h"
 #include "dex/quick/mir_to_lir-inl.h"
 #include "dex/reg_storage_eq.h"
@@ -890,11 +891,11 @@ static RegStorage GetArgPhysicalReg(RegLocation* loc, int* num_gpr_used, int* nu
 
 RegStorage Arm64Mir2Lir::GetArgMappingToPhysicalReg(int arg_num) {
   if (!in_to_reg_storage_mapping_.IsInitialized()) {
-    int start_vreg = cu_->num_dalvik_registers - cu_->num_ins;
+    int start_vreg = mir_graph_->GetFirstInVR();
     RegLocation* arg_locs = &mir_graph_->reg_location_[start_vreg];
 
     InToRegStorageArm64Mapper mapper;
-    in_to_reg_storage_mapping_.Initialize(arg_locs, cu_->num_ins, &mapper);
+    in_to_reg_storage_mapping_.Initialize(arg_locs, mir_graph_->GetNumOfInVRs(), &mapper);
   }
   return in_to_reg_storage_mapping_.Get(arg_num);
 }
@@ -928,14 +929,14 @@ void Arm64Mir2Lir::FlushIns(RegLocation* ArgLocs, RegLocation rl_method) {
     StoreRefDisp(TargetPtrReg(kSp), 0, rl_src.reg, kNotVolatile);
   }
 
-  if (cu_->num_ins == 0) {
+  if (mir_graph_->GetNumOfInVRs() == 0) {
     return;
   }
 
   // Handle dalvik registers.
   ScopedMemRefType mem_ref_type(this, ResourceMask::kDalvikReg);
-  int start_vreg = cu_->num_dalvik_registers - cu_->num_ins;
-  for (int i = 0; i < cu_->num_ins; i++) {
+  int start_vreg = mir_graph_->GetFirstInVR();
+  for (uint32_t i = 0; i < mir_graph_->GetNumOfInVRs(); i++) {
     RegLocation* t_loc = &ArgLocs[i];
     OpSize op_size;
     RegStorage reg = GetArgPhysicalReg(t_loc, &num_gpr_used, &num_fpr_used, &op_size);
@@ -1077,9 +1078,6 @@ int Arm64Mir2Lir::GenDalvikArgsRange(CallInfo* info, int call_state,
         next_arg++;
       }
     }
-
-    // Logic below assumes that Method pointer is at offset zero from SP.
-    DCHECK_EQ(VRegOffset(static_cast<int>(kVRegMethodPtrBaseReg)), 0);
 
     // The rest can be copied together
     int start_offset = SRegOffset(info->args[last_mapped_in + 1].s_reg_low);

@@ -572,7 +572,7 @@ void Mir2Lir::CompileDalvikInstruction(MIR* mir, BasicBlock* bb, LIR* label_list
       break;
 
     case Instruction::FILL_ARRAY_DATA:
-      GenFillArrayData(vB, rl_src[0]);
+      GenFillArrayData(mir, vB, rl_src[0]);
       break;
 
     case Instruction::FILLED_NEW_ARRAY:
@@ -879,12 +879,12 @@ void Mir2Lir::CompileDalvikInstruction(MIR* mir, BasicBlock* bb, LIR* label_list
 
     case Instruction::NEG_INT:
     case Instruction::NOT_INT:
-      GenArithOpInt(opcode, rl_dest, rl_src[0], rl_src[0]);
+      GenArithOpInt(opcode, rl_dest, rl_src[0], rl_src[0], opt_flags);
       break;
 
     case Instruction::NEG_LONG:
     case Instruction::NOT_LONG:
-      GenArithOpLong(opcode, rl_dest, rl_src[0], rl_src[0]);
+      GenArithOpLong(opcode, rl_dest, rl_src[0], rl_src[0], opt_flags);
       break;
 
     case Instruction::NEG_FLOAT:
@@ -900,9 +900,7 @@ void Mir2Lir::CompileDalvikInstruction(MIR* mir, BasicBlock* bb, LIR* label_list
       break;
 
     case Instruction::LONG_TO_INT:
-      rl_src[0] = UpdateLocWide(rl_src[0]);
-      rl_src[0] = NarrowRegLoc(rl_src[0]);
-      StoreValue(rl_dest, rl_src[0]);
+      GenLongToInt(rl_dest, rl_src[0]);
       break;
 
     case Instruction::INT_TO_BYTE:
@@ -944,7 +942,7 @@ void Mir2Lir::CompileDalvikInstruction(MIR* mir, BasicBlock* bb, LIR* label_list
         GenArithOpIntLit(opcode, rl_dest, rl_src[0],
                              mir_graph_->ConstantValue(rl_src[1].orig_sreg));
       } else {
-        GenArithOpInt(opcode, rl_dest, rl_src[0], rl_src[1]);
+        GenArithOpInt(opcode, rl_dest, rl_src[0], rl_src[1], opt_flags);
       }
       break;
 
@@ -964,7 +962,7 @@ void Mir2Lir::CompileDalvikInstruction(MIR* mir, BasicBlock* bb, LIR* label_list
           InexpensiveConstantInt(mir_graph_->ConstantValue(rl_src[1]), opcode)) {
         GenArithOpIntLit(opcode, rl_dest, rl_src[0], mir_graph_->ConstantValue(rl_src[1]));
       } else {
-        GenArithOpInt(opcode, rl_dest, rl_src[0], rl_src[1]);
+        GenArithOpInt(opcode, rl_dest, rl_src[0], rl_src[1], opt_flags);
       }
       break;
 
@@ -979,7 +977,7 @@ void Mir2Lir::CompileDalvikInstruction(MIR* mir, BasicBlock* bb, LIR* label_list
     case Instruction::OR_LONG_2ADDR:
     case Instruction::XOR_LONG_2ADDR:
       if (rl_src[0].is_const || rl_src[1].is_const) {
-        GenArithImmOpLong(opcode, rl_dest, rl_src[0], rl_src[1]);
+        GenArithImmOpLong(opcode, rl_dest, rl_src[0], rl_src[1], opt_flags);
         break;
       }
       // Note: intentional fallthrough.
@@ -990,7 +988,7 @@ void Mir2Lir::CompileDalvikInstruction(MIR* mir, BasicBlock* bb, LIR* label_list
     case Instruction::MUL_LONG_2ADDR:
     case Instruction::DIV_LONG_2ADDR:
     case Instruction::REM_LONG_2ADDR:
-      GenArithOpLong(opcode, rl_dest, rl_src[0], rl_src[1]);
+      GenArithOpLong(opcode, rl_dest, rl_src[0], rl_src[1], opt_flags);
       break;
 
     case Instruction::SHL_LONG:
@@ -1000,7 +998,7 @@ void Mir2Lir::CompileDalvikInstruction(MIR* mir, BasicBlock* bb, LIR* label_list
     case Instruction::SHR_LONG_2ADDR:
     case Instruction::USHR_LONG_2ADDR:
       if (rl_src[1].is_const) {
-        GenShiftImmOpLong(opcode, rl_dest, rl_src[0], rl_src[1]);
+        GenShiftImmOpLong(opcode, rl_dest, rl_src[0], rl_src[1], opt_flags);
       } else {
         GenShiftOpLong(opcode, rl_dest, rl_src[0], rl_src[1]);
       }
@@ -1087,9 +1085,17 @@ void Mir2Lir::HandleExtendedMethodMIR(BasicBlock* bb, MIR* mir) {
     case kMirOpSelect:
       GenSelect(bb, mir);
       break;
+    case kMirOpNullCheck: {
+      RegLocation rl_obj = mir_graph_->GetSrc(mir, 0);
+      rl_obj = LoadValue(rl_obj, kRefReg);
+      // An explicit check is done because it is not expected that when this is used,
+      // that it will actually trip up the implicit checks (since an invalid access
+      // is needed on the null object).
+      GenExplicitNullCheck(rl_obj.reg, mir->optimization_flags);
+      break;
+    }
     case kMirOpPhi:
     case kMirOpNop:
-    case kMirOpNullCheck:
     case kMirOpRangeCheck:
     case kMirOpDivZeroCheck:
     case kMirOpCheck:
@@ -1137,9 +1143,8 @@ bool Mir2Lir::MethodBlockCodeGen(BasicBlock* bb) {
 
   if (bb->block_type == kEntryBlock) {
     ResetRegPool();
-    int start_vreg = cu_->num_dalvik_registers - cu_->num_ins;
-    GenEntrySequence(&mir_graph_->reg_location_[start_vreg],
-                         mir_graph_->reg_location_[mir_graph_->GetMethodSReg()]);
+    int start_vreg = mir_graph_->GetFirstInVR();
+    GenEntrySequence(&mir_graph_->reg_location_[start_vreg], mir_graph_->GetMethodLoc());
   } else if (bb->block_type == kExitBlock) {
     ResetRegPool();
     GenExitSequence();
@@ -1178,7 +1183,7 @@ bool Mir2Lir::MethodBlockCodeGen(BasicBlock* bb) {
     if (opcode == kMirOpCheck) {
       // Combine check and work halves of throwing instruction.
       MIR* work_half = mir->meta.throw_insn;
-      mir->dalvikInsn.opcode = work_half->dalvikInsn.opcode;
+      mir->dalvikInsn = work_half->dalvikInsn;
       mir->meta = work_half->meta;  // Whatever the work_half had, we need to copy it.
       opcode = work_half->dalvikInsn.opcode;
       SSARepresentation* ssa_rep = work_half->ssa_rep;

@@ -19,6 +19,7 @@
 #include <inttypes.h>
 #include <queue>
 
+#include "base/bit_vector-inl.h"
 #include "base/stl_util.h"
 #include "compiler_internals.h"
 #include "dex_file-inl.h"
@@ -26,13 +27,18 @@
 #include "dex/global_value_numbering.h"
 #include "dex/quick/dex_file_to_method_inliner_map.h"
 #include "dex/quick/dex_file_method_inliner.h"
+#include "dex/verified_method.h"
 #include "leb128.h"
 #include "pass_driver_me_post_opt.h"
+#include "stack.h"
 #include "utils/scoped_arena_containers.h"
+#include "verifier/dex_gc_map.h"
+#include "verifier/method_verifier.h"
 
 namespace art {
 
 #define MAX_PATTERN_LEN 5
+MIRGraph::MIRGraphFctPtr MIRGraph::plugin_create_mir_graph_ = nullptr;
 
 const char* MIRGraph::extended_mir_op_names_[kMirOpLast - kMirOpFirst] = {
   "Phi",
@@ -65,6 +71,9 @@ const char* MIRGraph::extended_mir_op_names_[kMirOpLast - kMirOpFirst] = {
   "PackedSet",
   "ReserveVectorRegisters",
   "ReturnVectorRegisters",
+  "MemBarrier",
+  "PackedArrayGet",
+  "PackedArrayPut",
 };
 
 MIRGraph::MIRGraph(CompilationUnit* cu, ArenaAllocator* arena)
@@ -103,6 +112,7 @@ MIRGraph::MIRGraph(CompilationUnit* cu, ArenaAllocator* arena)
       current_code_item_(NULL),
       dex_pc_to_block_map_(arena, 0, kGrowableArrayMisc),
       m_units_(arena->Adapter()),
+      compiler_assigned_insn_size_(0u),
       method_stack_(arena->Adapter()),
       current_method_(kInvalidEntry),
       current_offset_(kInvalidEntry),
@@ -116,18 +126,35 @@ MIRGraph::MIRGraph(CompilationUnit* cu, ArenaAllocator* arena)
       arena_(arena),
       backward_branches_(0),
       forward_branches_(0),
-      compiler_temps_(arena, 6, kGrowableArrayMisc),
       num_non_special_compiler_temps_(0),
-      max_available_non_special_compiler_temps_(0),
+      max_available_special_compiler_temps_(1),  // We only need the method ptr as a special temp for now.
+      requested_backend_temp_(false),
+      compiler_temps_committed_(false),
       punt_to_interpreter_(false),
       merged_df_flags_(0u),
       ifield_lowering_infos_(arena, 0u),
       sfield_lowering_infos_(arena, 0u),
       method_lowering_infos_(arena, 0u),
-      gen_suspend_test_list_(arena, 0u) {
+      gen_suspend_test_list_(arena, 0u),
+      recalculate_gc_maps_(false),
+      offset_to_gc_map_(std::less<DexOffset>(), arena->Adapter()),
+      gc_map_entry_size_(0u),
+      gc_map_cache_(nullptr),
+      shorty_for_test_(nullptr) {
   try_block_addr_ = new (arena_) ArenaBitVector(arena_, 0, true /* expandable */);
-  max_available_special_compiler_temps_ = std::abs(static_cast<int>(kVRegNonSpecialTempBaseReg))
-      - std::abs(static_cast<int>(kVRegTempBaseReg));
+
+  if (cu_->instruction_set == kX86 || cu_->instruction_set == kX86_64) {
+    // X86 requires a temp to keep track of the method address.
+    // TODO For x86_64, addressing can be done with RIP. When that is implemented,
+    // this needs to be updated to reserve 0 temps for BE.
+    max_available_non_special_compiler_temps_ = cu_->target64 ? 2 : 1;
+    reserved_temps_for_backend_ = max_available_non_special_compiler_temps_;
+  } else {
+    // Other architectures do not have a known lower bound for non-special temps.
+    // We allow the update of the max to happen at BE initialization stage and simply set 0 for now.
+    max_available_non_special_compiler_temps_ = 0;
+    reserved_temps_for_backend_ = 0;
+  }
 }
 
 MIRGraph::~MIRGraph() {
@@ -154,9 +181,8 @@ int MIRGraph::ParseInsn(const uint16_t* code_ptr, MIR::DecodedInstruction* decod
 /* Split an existing block from the specified code offset into two */
 BasicBlock* MIRGraph::SplitBlock(DexOffset code_offset,
                                  BasicBlock* orig_block, BasicBlock** immed_pred_block_p) {
-  DCHECK_GT(code_offset, orig_block->start_offset);
   MIR* insn = orig_block->first_mir_insn;
-  MIR* prev = NULL;
+  MIR* prev = NULL;  // Will be set to instruction before split.
   while (insn) {
     if (insn->offset == code_offset) break;
     prev = insn;
@@ -165,6 +191,10 @@ BasicBlock* MIRGraph::SplitBlock(DexOffset code_offset,
   if (insn == NULL) {
     LOG(FATAL) << "Break split failed";
   }
+  // Now insn is at the instruction where we want to split, namely
+  // insn will be the first instruction of the "bottom" block.
+  // Similarly, prev will be the last instruction of the "top" block
+
   BasicBlock* bottom_block = NewMemBB(kDalvikByteCode, num_blocks_++);
   block_list_.Insert(bottom_block);
 
@@ -230,10 +260,11 @@ BasicBlock* MIRGraph::SplitBlock(DexOffset code_offset,
   DCHECK(insn != orig_block->first_mir_insn);
   DCHECK(insn == bottom_block->first_mir_insn);
   DCHECK_EQ(insn->offset, bottom_block->start_offset);
-  DCHECK(static_cast<int>(insn->dalvikInsn.opcode) == kMirOpCheck ||
-         !MIR::DecodedInstruction::IsPseudoMirOp(insn->dalvikInsn.opcode));
   DCHECK_EQ(dex_pc_to_block_map_.Get(insn->offset), orig_block->id);
+  // Scan the "bottom" instructions, remapping them to the
+  // newly created "bottom" block.
   MIR* p = insn;
+  p->bb = bottom_block->id;
   dex_pc_to_block_map_.Put(p->offset, bottom_block->id);
   while (p != bottom_block->last_mir_insn) {
     p = p->next;
@@ -247,7 +278,11 @@ BasicBlock* MIRGraph::SplitBlock(DexOffset code_offset,
      * the first in a BasicBlock, we can't hit it here.
      */
     if ((opcode == kMirOpCheck) || !MIR::DecodedInstruction::IsPseudoMirOp(opcode)) {
-      DCHECK_EQ(dex_pc_to_block_map_.Get(p->offset), orig_block->id);
+      BasicBlockId mapped_id = dex_pc_to_block_map_.Get(p->offset);
+      // At first glance the instructions should all be mapped to orig_block.
+      // However, multiple instructions may correspond to the same dex, hence an earlier
+      // instruction may have already moved the mapping for dex to bottom_block.
+      DCHECK((mapped_id == orig_block->id) || (mapped_id == bottom_block->id));
       dex_pc_to_block_map_.Put(p->offset, bottom_block->id);
     }
   }
@@ -265,7 +300,7 @@ BasicBlock* MIRGraph::SplitBlock(DexOffset code_offset,
  */
 BasicBlock* MIRGraph::FindBlock(DexOffset code_offset, bool split, bool create,
                                 BasicBlock** immed_pred_block_p) {
-  if (code_offset >= cu_->code_item->insns_size_in_code_units_) {
+  if (code_offset >= current_code_item_->insns_size_in_code_units_) {
     return NULL;
   }
 
@@ -339,10 +374,10 @@ bool MIRGraph::IsBadMonitorExitCatch(NarrowDexOffset monitor_exit_offset,
   // (We don't want to ignore all monitor-exit catches since one could enclose a synchronized
   // block in a try-block and catch the NPE, Error or Throwable and we should let it through;
   // even though a throwing monitor-exit certainly indicates a bytecode error.)
-  const Instruction* monitor_exit = Instruction::At(cu_->code_item->insns_ + monitor_exit_offset);
+  const Instruction* monitor_exit = Instruction::At(current_code_item_->insns_ + monitor_exit_offset);
   DCHECK(monitor_exit->Opcode() == Instruction::MONITOR_EXIT);
   int monitor_reg = monitor_exit->VRegA_11x();
-  const Instruction* check_insn = Instruction::At(cu_->code_item->insns_ + catch_offset);
+  const Instruction* check_insn = Instruction::At(current_code_item_->insns_ + catch_offset);
   DCHECK(check_insn->Opcode() == Instruction::MOVE_EXCEPTION);
   if (check_insn->VRegA_11x() == monitor_reg) {
     // Unexpected move-exception to the same register. Probably not the pattern we're looking for.
@@ -691,14 +726,7 @@ void MIRGraph::InlineMethod(const DexFile::CodeItem* code_item, uint32_t access_
     cu_->access_flags = access_flags;
     cu_->invoke_type = invoke_type;
     cu_->shorty = dex_file.GetMethodShorty(dex_file.GetMethodId(method_idx));
-    cu_->num_ins = current_code_item_->ins_size_;
-    cu_->num_regs = current_code_item_->registers_size_ - cu_->num_ins;
-    cu_->num_outs = current_code_item_->outs_size_;
-    cu_->num_dalvik_registers = current_code_item_->registers_size_;
-    cu_->insns = current_code_item_->insns_;
-    cu_->code_item = current_code_item_;
   } else {
-    UNIMPLEMENTED(FATAL) << "Nested inlining not implemented.";
     /*
      * Will need to manage storage for ins & outs, push prevous state and update
      * insert point.
@@ -730,7 +758,7 @@ void MIRGraph::InlineMethod(const DexFile::CodeItem* code_item, uint32_t access_
       opcode_count_[static_cast<int>(opcode)]++;
     }
 
-    int flags = Instruction::FlagsOf(insn->dalvikInsn.opcode);
+    int flags = insn->dalvikInsn.FlagsOf();
     int verify_flags = Instruction::VerifyFlagsOf(insn->dalvikInsn.opcode);
 
     uint64_t df_flags = GetDataFlowAttributes(insn);
@@ -871,14 +899,19 @@ uint64_t MIRGraph::GetDataFlowAttributes(MIR* mir) {
 
 // TODO: use a configurable base prefix, and adjust callers to supply pass name.
 /* Dump the CFG into a DOT graph */
-void MIRGraph::DumpCFG(const char* dir_prefix, bool all_blocks, const char *suffix) {
+void MIRGraph::DumpCFG(const char* dir_prefix, bool all_blocks, const char *suffix, const char* filename) {
   FILE* file;
   static AtomicInteger cnt(0);
 
   // Increment counter to get a unique file number.
   cnt++;
 
-  std::string fname(PrettyMethod(cu_->method_idx, *cu_->dex_file));
+  std::string fname;
+  if (filename == nullptr) {
+    fname.append(PrettyMethod(cu_->method_idx, *cu_->dex_file));
+  } else {
+    fname.append(filename);
+  }
   ReplaceSpecialChars(fname);
   fname = StringPrintf("%s%s%x%s_%d.dot", dir_prefix, fname.c_str(),
                       GetBasicBlock(GetEntryBlock()->fall_through)->start_offset,
@@ -913,27 +946,7 @@ void MIRGraph::DumpCFG(const char* dir_prefix, bool all_blocks, const char *suff
                 bb->first_mir_insn ? " | " : " ");
         for (mir = bb->first_mir_insn; mir; mir = mir->next) {
             int opcode = mir->dalvikInsn.opcode;
-            if (opcode > kMirOpSelect && opcode < kMirOpLast) {
-              if (opcode == kMirOpConstVector) {
-                fprintf(file, "    {%04x %s %d %d %d %d %d %d\\l}%s\\\n", mir->offset,
-                        extended_mir_op_names_[kMirOpConstVector - kMirOpFirst],
-                        mir->dalvikInsn.vA,
-                        mir->dalvikInsn.vB,
-                        mir->dalvikInsn.arg[0],
-                        mir->dalvikInsn.arg[1],
-                        mir->dalvikInsn.arg[2],
-                        mir->dalvikInsn.arg[3],
-                        mir->next ? " | " : " ");
-              } else {
-                fprintf(file, "    {%04x %s %d %d %d\\l}%s\\\n", mir->offset,
-                        extended_mir_op_names_[opcode - kMirOpFirst],
-                        mir->dalvikInsn.vA,
-                        mir->dalvikInsn.vB,
-                        mir->dalvikInsn.vC,
-                        mir->next ? " | " : " ");
-              }
-            } else {
-              fprintf(file, "    {%04x %s %s %s %s\\l}%s\\\n", mir->offset,
+            fprintf(file, "    {%04x %s %s %s %s %s %s %s\\l}%s\\\n", mir->offset,
                       mir->ssa_rep ? GetDalvikDisassembly(mir) :
                       !MIR::DecodedInstruction::IsPseudoMirOp(opcode) ?
                         Instruction::Name(mir->dalvikInsn.opcode) :
@@ -941,8 +954,10 @@ void MIRGraph::DumpCFG(const char* dir_prefix, bool all_blocks, const char *suff
                       (mir->optimization_flags & MIR_IGNORE_RANGE_CHECK) != 0 ? " no_rangecheck" : " ",
                       (mir->optimization_flags & MIR_IGNORE_NULL_CHECK) != 0 ? " no_nullcheck" : " ",
                       (mir->optimization_flags & MIR_IGNORE_SUSPEND_CHECK) != 0 ? " no_suspendcheck" : " ",
+                      (mir->optimization_flags & MIR_STORE_NON_TEMPORAL) != 0 ? " non_temporal" : " ",
+                      (mir->optimization_flags & MIR_CALLEE) != 0 ? " inlined" : " ",
+                      (mir->optimization_flags & MIR_IGNORE_CLINIT_CHECK) != 0 ? " no_clinit" : " ",
                       mir->next ? " | " : " ");
-            }
         }
         fprintf(file, "  }\"];\n\n");
     } else if (bb->block_type == kExceptionHandling) {
@@ -1174,7 +1189,7 @@ bool BasicBlock::RemoveMIRList(MIR* first_list_mir, MIR* last_list_mir) {
   }
 
   // Remove the BB information and also find the after_list.
-  for (MIR* mir = first_list_mir; mir != last_list_mir; mir = mir->next) {
+  for (MIR* mir = first_list_mir; mir != last_list_mir->next; mir = mir->next) {
     mir->bb = NullBasicBlockId;
   }
 
@@ -1212,6 +1227,225 @@ MIR* BasicBlock::GetNextUnconditionalMir(MIRGraph* mir_graph, MIR* current) {
   return next_mir;
 }
 
+static void FillTypeSizeString(uint32_t type_size, std::string* decoded_mir) {
+  DCHECK(decoded_mir != nullptr);
+  OpSize type = static_cast<OpSize>(type_size >> 16);
+  uint16_t vect_size = (type_size & 0xFFFF);
+
+  // Now print the type and vector size.
+  std::stringstream ss;
+  ss << " (type:";
+  ss << type;
+  ss << " vectsize:";
+  ss << vect_size;
+  ss << ")";
+
+  decoded_mir->append(ss.str());
+}
+
+void MIRGraph::DisassembleExtendedInstr(const MIR* mir, std::string* decoded_mir) {
+  DCHECK(decoded_mir != nullptr);
+  int opcode = mir->dalvikInsn.opcode;
+  SSARepresentation* ssa_rep = mir->ssa_rep;
+  int defs = (ssa_rep != nullptr) ? ssa_rep->num_defs : 0;
+  int uses = (ssa_rep != nullptr) ? ssa_rep->num_uses : 0;
+
+  if (opcode < kMirOpFirst) {
+    return; // It is not an extended instruction.
+  }
+
+  decoded_mir->append(extended_mir_op_names_[opcode - kMirOpFirst]);
+
+  switch (opcode) {
+    case kMirOpPhi: {
+      if (defs > 0 && uses > 0) {
+        BasicBlockId* incoming = mir->meta.phi_incoming;
+        decoded_mir->append(StringPrintf(" %s = (%s",
+                           GetSSANameWithConst(ssa_rep->defs[0], true).c_str(),
+                           GetSSANameWithConst(ssa_rep->uses[0], true).c_str()));
+        decoded_mir->append(StringPrintf(":%d", incoming[0]));
+        for (int i = 1; i < uses; i++) {
+          decoded_mir->append(StringPrintf(", %s:%d", GetSSANameWithConst(ssa_rep->uses[i], true).c_str(), incoming[i]));
+        }
+        decoded_mir->append(")");
+      }
+      break;
+    }
+    case kMirOpCopy:
+      if (ssa_rep != nullptr) {
+        decoded_mir->append(" ");
+        decoded_mir->append(GetSSANameWithConst(ssa_rep->defs[0], false));
+        if (defs > 1) {
+          decoded_mir->append(", ");
+          decoded_mir->append(GetSSANameWithConst(ssa_rep->defs[1], false));
+        }
+        decoded_mir->append(" = ");
+        decoded_mir->append(GetSSANameWithConst(ssa_rep->uses[0], false));
+        if (uses > 1) {
+          decoded_mir->append(", ");
+          decoded_mir->append(GetSSANameWithConst(ssa_rep->uses[1], false));
+        }
+      } else {
+        decoded_mir->append(StringPrintf(" v%d = v%d", mir->dalvikInsn.vA, mir->dalvikInsn.vB));
+      }
+      break;
+    case kMirOpSelect: {
+      std::stringstream ss;
+      if (ssa_rep != nullptr) {
+        ss << " " << GetSSANameWithConst(ssa_rep->defs[0], false) << " = ";
+      } else {
+        ss << " v" << mir->dalvikInsn.vA << " = ";
+      }
+
+      ss << mir->meta.ccode << " ";
+      if (ssa_rep != nullptr) {
+        // First print what is being compared.
+        ss << GetSSANameWithConst(ssa_rep->uses[0], false) << " ? ";
+        // Check if constant form needs to be handled.
+        if (ssa_rep->num_uses == 1) {
+          DCHECK_EQ(mir->dalvikInsn.arg[1], 1u);
+          ss << "#" << mir->dalvikInsn.vB << " : #" << mir->dalvikInsn.vC;
+        } else {
+          DCHECK_EQ(ssa_rep->num_uses, 3);
+          ss << GetSSANameWithConst(ssa_rep->uses[1], false) << " : ";
+          ss << GetSSANameWithConst(ssa_rep->uses[2], false);
+        }
+      } else {
+        // First print what is being compared.
+        ss << "v" << mir->dalvikInsn.arg[0] << " ? ";
+        // Check if constant form needs to be handled.
+        if (mir->dalvikInsn.arg[1] == 1) {
+          ss << "#" << mir->dalvikInsn.vB << " : #" << mir->dalvikInsn.vC;
+        } else {
+          ss << "v" << mir->dalvikInsn.vB << " : v" << mir->dalvikInsn.vC;
+        }
+      }
+      decoded_mir->append(ss.str());
+      break;
+    }
+    case kMirOpFusedCmplFloat:
+    case kMirOpFusedCmpgFloat:
+    case kMirOpFusedCmplDouble:
+    case kMirOpFusedCmpgDouble:
+    case kMirOpFusedCmpLong:
+      if (ssa_rep != nullptr) {
+        decoded_mir->append(" ");
+        decoded_mir->append(GetSSANameWithConst(ssa_rep->uses[0], false));
+        for (int i = 1; i < uses; i++) {
+          decoded_mir->append(", ");
+          decoded_mir->append(GetSSANameWithConst(ssa_rep->uses[i], false));
+        }
+      } else {
+        decoded_mir->append(StringPrintf(" v%d, v%d", mir->dalvikInsn.vA, mir->dalvikInsn.vB));
+      }
+      break;
+    case kMirOpMoveVector:
+      decoded_mir->append(StringPrintf(" vect%d = vect%d", mir->dalvikInsn.vA, mir->dalvikInsn.vB));
+      FillTypeSizeString(mir->dalvikInsn.vC, decoded_mir);
+      break;
+    case kMirOpPackedAddition:
+      decoded_mir->append(StringPrintf(" vect%d = vect%d + vect%d", mir->dalvikInsn.vA, mir->dalvikInsn.vA, mir->dalvikInsn.vB));
+      FillTypeSizeString(mir->dalvikInsn.vC, decoded_mir);
+      break;
+    case kMirOpPackedMultiply:
+      decoded_mir->append(StringPrintf(" vect%d = vect%d * vect%d", mir->dalvikInsn.vA, mir->dalvikInsn.vA, mir->dalvikInsn.vB));
+      FillTypeSizeString(mir->dalvikInsn.vC, decoded_mir);
+      break;
+    case kMirOpPackedSubtract:
+      decoded_mir->append(StringPrintf(" vect%d = vect%d - vect%d", mir->dalvikInsn.vA, mir->dalvikInsn.vA, mir->dalvikInsn.vB));
+      FillTypeSizeString(mir->dalvikInsn.vC, decoded_mir);
+      break;
+    case kMirOpPackedAnd:
+      decoded_mir->append(StringPrintf(" vect%d = vect%d & vect%d", mir->dalvikInsn.vA, mir->dalvikInsn.vA, mir->dalvikInsn.vB));
+      FillTypeSizeString(mir->dalvikInsn.vC, decoded_mir);
+      break;
+    case kMirOpPackedOr:
+      decoded_mir->append(StringPrintf(" vect%d = vect%d \\| vect%d", mir->dalvikInsn.vA, mir->dalvikInsn.vA, mir->dalvikInsn.vB));
+      FillTypeSizeString(mir->dalvikInsn.vC, decoded_mir);
+      break;
+    case kMirOpPackedXor:
+      decoded_mir->append(StringPrintf(" vect%d = vect%d ^ vect%d", mir->dalvikInsn.vA, mir->dalvikInsn.vA, mir->dalvikInsn.vB));
+      FillTypeSizeString(mir->dalvikInsn.vC, decoded_mir);
+      break;
+    case kMirOpPackedShiftLeft:
+      decoded_mir->append(StringPrintf(" vect%d = vect%d \\<\\< %d", mir->dalvikInsn.vA, mir->dalvikInsn.vA, mir->dalvikInsn.vB));
+      FillTypeSizeString(mir->dalvikInsn.vC, decoded_mir);
+      break;
+    case kMirOpPackedUnsignedShiftRight:
+      decoded_mir->append(StringPrintf(" vect%d = vect%d \\>\\>\\> %d", mir->dalvikInsn.vA, mir->dalvikInsn.vA, mir->dalvikInsn.vB));
+      FillTypeSizeString(mir->dalvikInsn.vC, decoded_mir);
+      break;
+    case kMirOpPackedSignedShiftRight:
+      decoded_mir->append(StringPrintf(" vect%d = vect%d \\>\\> %d", mir->dalvikInsn.vA, mir->dalvikInsn.vA, mir->dalvikInsn.vB));
+      FillTypeSizeString(mir->dalvikInsn.vC, decoded_mir);
+      break;
+    case kMirOpConstVector:
+      decoded_mir->append(StringPrintf(" vect%d = %x, %x, %x, %x", mir->dalvikInsn.vA, mir->dalvikInsn.arg[0],
+                                      mir->dalvikInsn.arg[1], mir->dalvikInsn.arg[2], mir->dalvikInsn.arg[3]));
+      break;
+    case kMirOpPackedSet:
+      if (ssa_rep != nullptr) {
+        decoded_mir->append(StringPrintf(" vect%d = %s", mir->dalvikInsn.vA,
+              GetSSANameWithConst(ssa_rep->uses[0], false).c_str()));
+        if (uses > 1) {
+          decoded_mir->append(", ");
+          decoded_mir->append(GetSSANameWithConst(ssa_rep->uses[1], false));
+        }
+      } else {
+        decoded_mir->append(StringPrintf(" vect%d = v%d", mir->dalvikInsn.vA, mir->dalvikInsn.vB));
+      }
+      FillTypeSizeString(mir->dalvikInsn.vC, decoded_mir);
+      break;
+    case kMirOpPackedAddReduce:
+      if (ssa_rep != nullptr) {
+        decoded_mir->append(" ");
+        decoded_mir->append(GetSSANameWithConst(ssa_rep->defs[0], false));
+        if (defs > 1) {
+          decoded_mir->append(", ");
+          decoded_mir->append(GetSSANameWithConst(ssa_rep->defs[1], false));
+        }
+        decoded_mir->append(StringPrintf(" = vect%d + %s", mir->dalvikInsn.vB,
+            GetSSANameWithConst(ssa_rep->uses[0], false).c_str()));
+        if (uses > 1) {
+          decoded_mir->append(", ");
+          decoded_mir->append(GetSSANameWithConst(ssa_rep->uses[1], false));
+        }
+      } else {
+        decoded_mir->append(StringPrintf("v%d = vect%d + v%d", mir->dalvikInsn.vA, mir->dalvikInsn.vB, mir->dalvikInsn.vA));
+      }
+      FillTypeSizeString(mir->dalvikInsn.vC, decoded_mir);
+      break;
+    case kMirOpPackedReduce:
+      if (ssa_rep != nullptr) {
+        decoded_mir->append(" ");
+        decoded_mir->append(GetSSANameWithConst(ssa_rep->defs[0], false));
+        if (defs > 1) {
+          decoded_mir->append(", ");
+          decoded_mir->append(GetSSANameWithConst(ssa_rep->defs[1], false));
+        }
+        decoded_mir->append(StringPrintf(" = vect%d (extr_idx:%d)", mir->dalvikInsn.vB, mir->dalvikInsn.arg[0]));
+      } else {
+        decoded_mir->append(StringPrintf(" v%d = vect%d (extr_idx:%d)", mir->dalvikInsn.vA,
+                                         mir->dalvikInsn.vB, mir->dalvikInsn.arg[0]));
+      }
+      FillTypeSizeString(mir->dalvikInsn.vC, decoded_mir);
+      break;
+    case kMirOpReserveVectorRegisters:
+    case kMirOpReturnVectorRegisters:
+      decoded_mir->append(StringPrintf(" vect%d - vect%d", mir->dalvikInsn.vA, mir->dalvikInsn.vB));
+      break;
+    case kMirOpMemBarrier: {
+      decoded_mir->append(" type:");
+      std::stringstream ss;
+      ss << static_cast<MemBarrierKind>(mir->dalvikInsn.vA);
+      decoded_mir->append(ss.str());
+      break;
+    }
+    default:
+      break;
+  }
+}
+
 char* MIRGraph::GetDalvikDisassembly(const MIR* mir) {
   MIR::DecodedInstruction insn = mir->dalvikInsn;
   std::string str;
@@ -1221,120 +1455,114 @@ char* MIRGraph::GetDalvikDisassembly(const MIR* mir) {
   bool nop = false;
   SSARepresentation* ssa_rep = mir->ssa_rep;
   Instruction::Format dalvik_format = Instruction::k10x;  // Default to no-operand format.
-  int defs = (ssa_rep != NULL) ? ssa_rep->num_defs : 0;
-  int uses = (ssa_rep != NULL) ? ssa_rep->num_uses : 0;
 
-  // Handle special cases.
+  // Handle special cases that recover the original dalvik instruction.
   if ((opcode == kMirOpCheck) || (opcode == kMirOpCheckPart2)) {
     str.append(extended_mir_op_names_[opcode - kMirOpFirst]);
     str.append(": ");
     // Recover the original Dex instruction.
     insn = mir->meta.throw_insn->dalvikInsn;
     ssa_rep = mir->meta.throw_insn->ssa_rep;
-    defs = ssa_rep->num_defs;
-    uses = ssa_rep->num_uses;
     opcode = insn.opcode;
   } else if (opcode == kMirOpNop) {
     str.append("[");
-    // Recover original opcode.
-    insn.opcode = Instruction::At(current_code_item_->insns_ + mir->offset)->Opcode();
-    opcode = insn.opcode;
+    if (mir->offset < current_code_item_->insns_size_in_code_units_) {
+      // Recover original opcode.
+      insn.opcode = Instruction::At(current_code_item_->insns_ + mir->offset)->Opcode();
+      opcode = insn.opcode;
+    }
     nop = true;
   }
+  int defs = (ssa_rep != NULL) ? ssa_rep->num_defs : 0;
+  int uses = (ssa_rep != NULL) ? ssa_rep->num_uses : 0;
 
   if (MIR::DecodedInstruction::IsPseudoMirOp(opcode)) {
-    str.append(extended_mir_op_names_[opcode - kMirOpFirst]);
+    // Note that this does not check the MIR's opcode in all cases. In cases where it
+    // recovered dalvik instruction, it uses opcode of that instead of the extended one.
+    DisassembleExtendedInstr(mir, &str);
   } else {
     dalvik_format = Instruction::FormatOf(insn.opcode);
-    flags = Instruction::FlagsOf(insn.opcode);
+    flags = insn.FlagsOf();
     str.append(Instruction::Name(insn.opcode));
-  }
 
-  if (opcode == kMirOpPhi) {
-    BasicBlockId* incoming = mir->meta.phi_incoming;
-    str.append(StringPrintf(" %s = (%s",
-               GetSSANameWithConst(ssa_rep->defs[0], true).c_str(),
-               GetSSANameWithConst(ssa_rep->uses[0], true).c_str()));
-    str.append(StringPrintf(":%d", incoming[0]));
-    int i;
-    for (i = 1; i < uses; i++) {
-      str.append(StringPrintf(", %s:%d",
-                              GetSSANameWithConst(ssa_rep->uses[i], true).c_str(),
-                              incoming[i]));
-    }
-    str.append(")");
-  } else if ((flags & Instruction::kBranch) != 0) {
-    // For branches, decode the instructions to print out the branch targets.
-    int offset = 0;
-    switch (dalvik_format) {
-      case Instruction::k21t:
-        str.append(StringPrintf(" %s,", GetSSANameWithConst(ssa_rep->uses[0], false).c_str()));
-        offset = insn.vB;
-        break;
-      case Instruction::k22t:
-        str.append(StringPrintf(" %s, %s,", GetSSANameWithConst(ssa_rep->uses[0], false).c_str(),
-                   GetSSANameWithConst(ssa_rep->uses[1], false).c_str()));
-        offset = insn.vC;
-        break;
-      case Instruction::k10t:
-      case Instruction::k20t:
-      case Instruction::k30t:
-        offset = insn.vA;
-        break;
-      default:
-        LOG(FATAL) << "Unexpected branch format " << dalvik_format << " from " << insn.opcode;
-    }
-    str.append(StringPrintf(" 0x%x (%c%x)", mir->offset + offset,
-                            offset > 0 ? '+' : '-', offset > 0 ? offset : -offset));
-  } else {
     // For invokes-style formats, treat wide regs as a pair of singles.
     bool show_singles = ((dalvik_format == Instruction::k35c) ||
                          (dalvik_format == Instruction::k3rc));
     if (defs != 0) {
-      str.append(StringPrintf(" %s", GetSSANameWithConst(ssa_rep->defs[0], false).c_str()));
+      str.append(" ");
+      str.append(GetSSANameWithConst(ssa_rep->defs[0], false));
+      if (defs > 1) {
+        str.append(", ");
+        str.append(GetSSANameWithConst(ssa_rep->defs[1], false));
+      }
       if (uses != 0) {
         str.append(", ");
       }
     }
     for (int i = 0; i < uses; i++) {
-      str.append(
-          StringPrintf(" %s", GetSSANameWithConst(ssa_rep->uses[i], show_singles).c_str()));
+      str.append(" ");
+      str.append(GetSSANameWithConst(ssa_rep->uses[i], show_singles));
       if (!show_singles && (reg_location_ != NULL) && reg_location_[i].wide) {
         // For the listing, skip the high sreg.
         i++;
       }
-      if (i != (uses -1)) {
+      if (i != (uses - 1)) {
         str.append(",");
       }
     }
+
     switch (dalvik_format) {
       case Instruction::k11n:  // Add one immediate from vB.
       case Instruction::k21s:
       case Instruction::k31i:
       case Instruction::k21h:
-        str.append(StringPrintf(", #%d", insn.vB));
+        str.append(StringPrintf(", #0x%x", insn.vB));
         break;
       case Instruction::k51l:  // Add one wide immediate.
         str.append(StringPrintf(", #%" PRId64, insn.vB_wide));
         break;
       case Instruction::k21c:  // One register, one string/type/method index.
       case Instruction::k31c:
-        str.append(StringPrintf(", index #%d", insn.vB));
+        str.append(StringPrintf(", index #0x%x", insn.vB));
         break;
       case Instruction::k22c:  // Two registers, one string/type/method index.
-        str.append(StringPrintf(", index #%d", insn.vC));
+        str.append(StringPrintf(", index #0x%x", insn.vC));
         break;
       case Instruction::k22s:  // Add one immediate from vC.
       case Instruction::k22b:
-        str.append(StringPrintf(", #%d", insn.vC));
+        str.append(StringPrintf(", #0x%x", insn.vC));
         break;
-      default: {
+      default:
         // Nothing left to print.
-      }
+        break;
     }
-  }
-  if (nop) {
-    str.append("]--optimized away");
+
+    if ((flags & Instruction::kBranch) != 0) {
+      // For branches, decode the instructions to print out the branch targets.
+      int offset = 0;
+      switch (dalvik_format) {
+        case Instruction::k21t:
+          offset = insn.vB;
+          break;
+        case Instruction::k22t:
+          offset = insn.vC;
+          break;
+        case Instruction::k10t:
+        case Instruction::k20t:
+        case Instruction::k30t:
+          offset = insn.vA;
+          break;
+        default:
+          LOG(FATAL) << "Unexpected branch format " << dalvik_format << " from " << insn.opcode;
+          break;
+      }
+      str.append(StringPrintf(", 0x%x (%c%x)", mir->offset + offset,
+                              offset > 0 ? '+' : '-', offset > 0 ? offset : -offset));
+    }
+
+    if (nop) {
+      str.append("]--optimized away");
+    }
   }
   int length = str.length() + 1;
   ret = static_cast<char*>(arena_->Alloc(length, kArenaAllocDFInfo));
@@ -1357,7 +1585,12 @@ std::string MIRGraph::GetSSAName(int ssa_reg) {
   // TODO: This value is needed for LLVM and debugging. Currently, we compute this and then copy to
   //       the arena. We should be smarter and just place straight into the arena, or compute the
   //       value more lazily.
-  return StringPrintf("v%d_%d", SRegToVReg(ssa_reg), GetSSASubscript(ssa_reg));
+  int vreg = SRegToVReg(ssa_reg);
+  if (vreg >= static_cast<int>(GetFirstTempVR())) {
+    return StringPrintf("t%d_%d", SRegToVReg(ssa_reg), GetSSASubscript(ssa_reg));
+  } else {
+    return StringPrintf("v%d_%d", SRegToVReg(ssa_reg), GetSSASubscript(ssa_reg));
+  }
 }
 
 // Similar to GetSSAName, but if ssa name represents an immediate show that as well.
@@ -1367,7 +1600,8 @@ std::string MIRGraph::GetSSANameWithConst(int ssa_reg, bool singles_only) {
     return GetSSAName(ssa_reg);
   }
   if (IsConst(reg_location_[ssa_reg])) {
-    if (!singles_only && reg_location_[ssa_reg].wide) {
+    if (!singles_only && reg_location_[ssa_reg].wide &&
+        !reg_location_[ssa_reg].high_word) {
       return StringPrintf("v%d_%d#0x%" PRIx64, SRegToVReg(ssa_reg), GetSSASubscript(ssa_reg),
                           ConstantValueWide(reg_location_[ssa_reg]));
     } else {
@@ -1375,7 +1609,12 @@ std::string MIRGraph::GetSSANameWithConst(int ssa_reg, bool singles_only) {
                           ConstantValue(reg_location_[ssa_reg]));
     }
   } else {
-    return StringPrintf("v%d_%d", SRegToVReg(ssa_reg), GetSSASubscript(ssa_reg));
+    int vreg = SRegToVReg(ssa_reg);
+    if (vreg >= static_cast<int>(GetFirstTempVR())) {
+      return StringPrintf("t%d_%d", SRegToVReg(ssa_reg), GetSSASubscript(ssa_reg));
+    } else {
+      return StringPrintf("v%d_%d", SRegToVReg(ssa_reg), GetSSASubscript(ssa_reg));
+    }
   }
 }
 
@@ -1401,6 +1640,11 @@ void MIRGraph::GetBlockName(BasicBlock* bb, char* name) {
 }
 
 const char* MIRGraph::GetShortyFromTargetIdx(int target_idx) {
+  if (shorty_for_test_ != nullptr) {
+    // To facilitate unit testing when no code item is available,
+    // the testing facility can set up the shorty information.
+    return shorty_for_test_[target_idx];
+  }
   // TODO: for inlining support, use current code unit.
   const DexFile::MethodId& method_id = cu_->dex_file->GetMethodId(target_idx);
   return cu_->dex_file->GetShorty(method_id.proto_idx_);
@@ -1419,7 +1663,7 @@ void MIRGraph::DumpMIRGraph() {
   };
 
   LOG(INFO) << "Compiling " << PrettyMethod(cu_->method_idx, *cu_->dex_file);
-  LOG(INFO) << cu_->insns << " insns";
+  LOG(INFO) << GetInsns(0) << " insns";
   LOG(INFO) << GetNumBlocks() << " blocks in total";
   GrowableArray<BasicBlock*>::Iterator iterator(&block_list_);
 
@@ -1481,9 +1725,14 @@ MIR* MIRGraph::NewMIR() {
   return mir;
 }
 
+BasicBlock* MIRGraph::CreateBasicBlock() {
+  BasicBlock* bb = new (arena_) BasicBlock();
+  return bb;
+}
+
 // Allocate a new basic block.
 BasicBlock* MIRGraph::NewMemBB(BBType block_type, int block_id) {
-  BasicBlock* bb = new (arena_) BasicBlock();
+  BasicBlock* bb = CreateBasicBlock();
 
   bb->block_type = block_type;
   bb->id = block_id;
@@ -1506,6 +1755,9 @@ void MIRGraph::InitializeMethodUses() {
   int num_ssa_regs = GetNumSSARegs();
   use_counts_.Resize(num_ssa_regs + 32);
   raw_use_counts_.Resize(num_ssa_regs + 32);
+  // Resize does not actually reset the number of used, so reset before initialization.
+  use_counts_.Reset();
+  raw_use_counts_.Reset();
   // Initialize list.
   for (int i = 0; i < num_ssa_regs; i++) {
     use_counts_.Insert(0);
@@ -1516,7 +1768,7 @@ void MIRGraph::InitializeMethodUses() {
 void MIRGraph::SSATransformationStart() {
   DCHECK(temp_scoped_alloc_.get() == nullptr);
   temp_scoped_alloc_.reset(ScopedArenaAllocator::Create(&cu_->arena_stack));
-  temp_bit_vector_size_ = cu_->num_dalvik_registers;
+  temp_bit_vector_size_ = GetNumOfCodeAndTempVRs();
   temp_bit_vector_ = new (temp_scoped_alloc_.get()) ArenaBitVector(
       temp_scoped_alloc_.get(), temp_bit_vector_size_, false, kBitMapRegisterV);
 
@@ -1534,6 +1786,46 @@ void MIRGraph::SSATransformationEnd() {
   temp_bit_vector_ = nullptr;
   DCHECK(temp_scoped_alloc_.get() != nullptr);
   temp_scoped_alloc_.reset();
+}
+
+size_t MIRGraph::GetNumDalvikInsns() const {
+  size_t cumulative_size = 0u;
+  bool counted_current_item = false;
+  const uint8_t size_for_null_code_item = 2u;
+
+  for (auto it : m_units_) {
+    const DexFile::CodeItem* code_item = it->GetCodeItem();
+    // Even if the code item is null, we still count non-zero value so that
+    // each m_unit is counted as having impact.
+    cumulative_size += (code_item == nullptr ?
+        size_for_null_code_item : code_item->insns_size_in_code_units_);
+    if (code_item == current_code_item_) {
+      counted_current_item = true;
+    }
+  }
+
+  // If the current code item was not counted yet, count it now.
+  // This can happen for example in unit tests where some fields like m_units_
+  // are not initialized.
+  if (counted_current_item == false) {
+    cumulative_size += (current_code_item_ == nullptr ?
+        size_for_null_code_item : current_code_item_->insns_size_in_code_units_);
+  }
+
+  // Finally, count the size of offsets compiler assigned.
+  cumulative_size += compiler_assigned_insn_size_;
+
+  return cumulative_size;
+}
+
+DexOffset MIRGraph::GetNewOffset() {
+  // Getting the size in code units is good enough for providing a non-overlapping offset.
+  DexOffset new_offset = GetNumDalvikInsns();
+
+  // Now that we got a new offset, we need to keep track of size of this instruction.
+  compiler_assigned_insn_size_ += 2u;
+
+  return new_offset;
 }
 
 static BasicBlock* SelectTopologicalSortOrderFallBack(
@@ -2062,6 +2354,11 @@ void BasicBlock::Hide(CompilationUnit* c_unit) {
     // Replace child with null child.
     childPtr->predecessors->Delete(id);
   }
+
+  // Remove link to children.
+  taken = NullBasicBlockId;
+  fall_through = NullBasicBlockId;
+  successor_block_list_type = kNotUsed;
 }
 
 bool BasicBlock::IsSSALiveOut(const CompilationUnit* c_unit, int ssa_reg) {
@@ -2177,6 +2474,406 @@ void MIRGraph::CalculateBasicBlockInformation() {
 
 void MIRGraph::InitializeBasicBlockData() {
   num_blocks_ = block_list_.Size();
+}
+
+int MIR::DecodedInstruction::FlagsOf() const {
+  // Calculate new index.
+  int idx = static_cast<int>(opcode) - kNumPackedOpcodes;
+
+  // Check if it is an extended or not.
+  if (idx < 0) {
+    return Instruction::FlagsOf(opcode);
+  }
+
+  // For extended, we use a switch.
+  switch (static_cast<int>(opcode)) {
+    case kMirOpPhi:
+      return Instruction::kContinue;
+    case kMirOpCopy:
+      return Instruction::kContinue;
+    case kMirOpFusedCmplFloat:
+      return Instruction::kContinue | Instruction::kBranch;
+    case kMirOpFusedCmpgFloat:
+      return Instruction::kContinue | Instruction::kBranch;
+    case kMirOpFusedCmplDouble:
+      return Instruction::kContinue | Instruction::kBranch;
+    case kMirOpFusedCmpgDouble:
+      return Instruction::kContinue | Instruction::kBranch;
+    case kMirOpFusedCmpLong:
+      return Instruction::kContinue | Instruction::kBranch;
+    case kMirOpNop:
+      return Instruction::kContinue;
+    case kMirOpNullCheck:
+      return Instruction::kContinue | Instruction::kThrow;
+    case kMirOpRangeCheck:
+      return Instruction::kContinue | Instruction::kThrow;
+    case kMirOpDivZeroCheck:
+      return Instruction::kContinue | Instruction::kThrow;
+    case kMirOpCheck:
+      return Instruction::kContinue | Instruction::kThrow;
+    case kMirOpCheckPart2:
+      return Instruction::kContinue;
+    case kMirOpSelect:
+      return Instruction::kContinue;
+    case kMirOpConstVector:
+      return Instruction::kContinue;
+    case kMirOpMoveVector:
+      return Instruction::kContinue;
+    case kMirOpPackedMultiply:
+      return Instruction::kContinue;
+    case kMirOpPackedAddition:
+      return Instruction::kContinue;
+    case kMirOpPackedSubtract:
+      return Instruction::kContinue;
+    case kMirOpPackedShiftLeft:
+      return Instruction::kContinue;
+    case kMirOpPackedSignedShiftRight:
+      return Instruction::kContinue;
+    case kMirOpPackedUnsignedShiftRight:
+      return Instruction::kContinue;
+    case kMirOpPackedAnd:
+      return Instruction::kContinue;
+    case kMirOpPackedOr:
+      return Instruction::kContinue;
+    case kMirOpPackedXor:
+      return Instruction::kContinue;
+    case kMirOpPackedAddReduce:
+      return Instruction::kContinue;
+    case kMirOpPackedReduce:
+      return Instruction::kContinue;
+    case kMirOpPackedSet:
+      return Instruction::kContinue;
+    case kMirOpReserveVectorRegisters:
+      return Instruction::kContinue;
+    case kMirOpReturnVectorRegisters:
+      return Instruction::kContinue;
+    case kMirOpMemBarrier:
+      return Instruction::kContinue;
+    case kMirOpPackedArrayGet:
+      return Instruction::kContinue | Instruction::kThrow;
+    case kMirOpPackedArrayPut:
+      return Instruction::kContinue | Instruction::kThrow;
+    default:
+      LOG(WARNING) << "ExtendedFlagsOf: Unhandled case: " << static_cast<int> (opcode);
+      return 0;
+  }
+}
+
+void MIRGraph::RecordNewMirGCMap(MIR* mir, ArenaBitVector* gc_bit_map) {
+  // First record the new GC map.
+  auto it = offset_to_gc_map_.find(mir->offset);
+  if (it != offset_to_gc_map_.end()) {
+    // Make sure both vectors have the same map.
+    DCHECK(gc_bit_map->Equal(it->second) == true);
+  } else {
+    offset_to_gc_map_.Put(mir->offset, gc_bit_map);
+  }
+
+  // Now compute how many bytes are needed for the GC map.
+  // If larger than before, make sure that all maps that already exist are expanded.
+  int last_bit = gc_bit_map->GetHighestBitSet();
+  size_t bytes_needed = last_bit < 0 ? 1 : ((last_bit / kBitsPerByte) + 1);
+  ExpandGcMapEntries(bytes_needed);
+}
+
+void MIRGraph::ExpandGcMapEntries(size_t new_size_in_bytes) {
+  if (new_size_in_bytes > gc_map_entry_size_) {
+    // We have increased the entry size. Do a sanity check to make sure that the allocated
+    // size can account for this new entry size. We do not need to expand anything because
+    // we should've allocated the internal map to be as big as all of the posible registers.
+    if (kIsDebugBuild) {
+      for (auto entry = offset_to_gc_map_.begin(); entry != offset_to_gc_map_.end(); entry++) {
+        ArenaBitVector* gc_bit_map = entry->second;
+        size_t size_raw_map = gc_bit_map->GetSizeOf();
+        CHECK_GE(size_raw_map, new_size_in_bytes);
+      }
+    }
+
+    gc_map_entry_size_ = new_size_in_bytes;
+  }
+}
+
+size_t MIRGraph::GetGCMapEntrySize() {
+  // In order to provide a correct size for GC map, we also check the entry size
+  // for the gc_map calculated by the verifier.
+  const std::vector<uint8_t>& gc_map_raw = GetCurrentDexCompilationUnit()->GetVerifiedMethod()->GetDexGcMap();
+  verifier::DexPcToReferenceMap dex_gc_map(&(gc_map_raw)[0]);
+  DCHECK_EQ(gc_map_raw.size(), dex_gc_map.RawSize());
+
+  // Expand the gc map entries if needed.
+  ExpandGcMapEntries(dex_gc_map.RegWidth());
+
+  return gc_map_entry_size_;
+}
+
+void MIRGraph::ExpandGcMapEntriesToAtLeastVerifierSize() {
+  // When asking for size, it will always make sure to provide the size that takes
+  // into account all current maps generated by compiler and also all maps from
+  // verifier.
+  GetGCMapEntrySize();
+}
+
+const uint8_t* MIRGraph::GetVerifierGCMap(DexOffset offset) {
+  const std::vector<uint8_t>& gc_map_raw = GetCurrentDexCompilationUnit()->GetVerifiedMethod()->GetDexGcMap();
+  verifier::DexPcToReferenceMap dex_gc_map(&(gc_map_raw)[0]);
+  DCHECK_EQ(gc_map_raw.size(), dex_gc_map.RawSize());
+
+  return dex_gc_map.FindBitMap(offset, false);
+}
+
+const ArenaBitVector* MIRGraph::GetGCMapAsBitVector(DexOffset offset) {
+  // If we have already computed map for this offset, retrieve that.
+  auto it = offset_to_gc_map_.find(offset);
+  if (it != offset_to_gc_map_.end()) {
+    ArenaBitVector* gc_map = it->second;
+    return gc_map;
+  }
+
+  // Return nullptr if no BitVector exists for this offset.
+  return nullptr;
+}
+
+const uint8_t* MIRGraph::GetGCMap(DexOffset offset, bool verifier_map_as_backup) {
+  const uint8_t* gc_map = nullptr;
+
+  // If we have already computed a map for this offset, retrieve that.
+  const ArenaBitVector* gc_bit_map = GetGCMapAsBitVector(offset);
+  if (gc_bit_map != nullptr) {
+    // Make sure that we have expanded our entries to maximum size.
+    ExpandGcMapEntriesToAtLeastVerifierSize();
+    gc_map = reinterpret_cast<const uint8_t*>(gc_bit_map->GetRawStorage());
+  } else {
+    // Not in precomputed map, now check if we can get one from verifier.
+    if (verifier_map_as_backup) {
+      gc_map = GetVerifierGCMap(offset);
+
+      const std::vector<uint8_t>& gc_map_raw = GetCurrentDexCompilationUnit()->GetVerifiedMethod()->GetDexGcMap();
+      verifier::DexPcToReferenceMap dex_gc_map(&(gc_map_raw)[0]);
+      DCHECK_EQ(gc_map_raw.size(), dex_gc_map.RawSize());
+
+      // Since we may have a mix of verifier and compiler generated maps, make sure
+      // we return a map that is the maximum entry width. So therefore prepare
+      // our map cache to store this expanded map.
+      size_t verifier_map_size = dex_gc_map.RegWidth();
+      size_t compiler_map_size = GetGCMapEntrySize();
+      if (verifier_map_size < compiler_map_size) {
+        // The verifier map is smaller than compiler generated map.
+        // Since we provide a single size, we need to provide a map that is the desired size.
+        if (gc_map_cache_ == nullptr) {
+          size_t total_size = std::max<size_t>(GetNumOfCodeAndTempVRs(), compiler_map_size);
+          gc_map_cache_ = new (GetArena()) ArenaBitVector(GetArena(), total_size, false);
+        }
+        gc_map_cache_->ClearAllBits();
+
+        // Convert to BitVector.
+        for (size_t reg = 0; reg < verifier_map_size; reg++) {
+          if (((gc_map[reg / kBitsPerByte] >> (reg % kBitsPerByte)) & 0x01) != 0) {
+            gc_map_cache_->SetBit(reg);
+          }
+        }
+
+        // Provide the expanded gc map.
+        gc_map = reinterpret_cast<const uint8_t*>(gc_map_cache_->GetRawStorage());
+      }
+    }
+  }
+
+  return gc_map;
+}
+
+bool MIRGraph::IsCodeMotionAcrossSafepointAllowed() const {
+  return (cu_->disable_opt & (1 << kSuppressCodeMotionAcrossSafepoint)) == 0;
+}
+
+bool MIRGraph::HasSafepoint(MIR* mir) const {
+  int opcode = mir->dalvikInsn.opcode;
+  if (opcode == kMirOpCheck) {
+    // The check instruction is simply for modeling. We need to check the real instruction.
+    mir = mir->meta.throw_insn;
+    opcode = mir->dalvikInsn.opcode;
+  }
+
+  switch (opcode) {
+    case Instruction::MOVE_EXCEPTION:
+      // Move-exceptions don't automatically have safepoints themselves.
+      // But a PC export tends to be generated at beginning of catch block, so might
+      // as well capture it here so we can show the map. However, it is not a
+      // real safepoint since no interaction with runtime happens here. If any GC
+      // would run, it would be with offset of thrower before we enter catch.
+      return true;
+
+    case Instruction::SGET:
+    case Instruction::SGET_WIDE:
+    case Instruction::SGET_OBJECT:
+    case Instruction::SGET_BOOLEAN:
+    case Instruction::SGET_BYTE:
+    case Instruction::SGET_CHAR:
+    case Instruction::SGET_SHORT:
+    case Instruction::SPUT:
+    case Instruction::SPUT_WIDE:
+    case Instruction::SPUT_OBJECT:
+    case Instruction::SPUT_BOOLEAN:
+    case Instruction::SPUT_BYTE:
+    case Instruction::SPUT_CHAR:
+    case Instruction::SPUT_SHORT: {
+      // For sgets/sputs we have additional logic to make it possible to
+      // better capture when it will generate safepoint.
+      const MirSFieldLoweringInfo& field_info = GetSFieldLoweringInfo(mir);
+      if (field_info.FastGet() || field_info.FastPut()) {
+        if (field_info.IsReferrersClass()) {
+          // Everything already initialized.
+          return false;
+        } else {
+          if (field_info.IsInitialized() ||
+              (mir->optimization_flags & MIR_IGNORE_CLINIT_CHECK) != 0) {
+            // Everything already initialized.
+            return false;
+          }
+        }
+      }
+
+      // Possible call to class initialization/resolution.
+      return true;
+    }
+
+    case Instruction::INVOKE_VIRTUAL:
+    case Instruction::INVOKE_SUPER:
+    case Instruction::INVOKE_DIRECT:
+    case Instruction::INVOKE_STATIC:
+    case Instruction::INVOKE_INTERFACE:
+    case Instruction::INVOKE_VIRTUAL_RANGE:
+    case Instruction::INVOKE_SUPER_RANGE:
+    case Instruction::INVOKE_DIRECT_RANGE:
+    case Instruction::INVOKE_STATIC_RANGE:
+    case Instruction::INVOKE_INTERFACE_RANGE:
+    case Instruction::INVOKE_VIRTUAL_QUICK: {
+      if ((mir->optimization_flags & MIR_INLINED) != 0) {
+        // So the invoke has been marked as being inlined.
+        // Check if it still has null check side effect.
+        bool is_static = opcode == Instruction::INVOKE_STATIC || Instruction::INVOKE_STATIC_RANGE;
+        if (is_static || ((mir->optimization_flags & MIR_IGNORE_NULL_CHECK) != 0)) {
+          return false;
+        }
+      }
+
+      // TODO We can do a better job with intrinsics if they have no slow path.
+      return true;
+    }
+
+    case Instruction::DIV_INT:
+    case Instruction::REM_INT:
+    case Instruction::DIV_INT_2ADDR:
+    case Instruction::REM_INT_2ADDR: {
+      // Check for division by zero.
+      if (mir->ssa_rep != nullptr) {
+        if (IsConst(mir->ssa_rep->uses[1]) == true) {
+          return (ConstantValue(mir->ssa_rep->uses[1]) == 0);
+        }
+      }
+
+      // We don't know value of denominator but check if it has proven it won't throw.
+      return (mir->optimization_flags & MIR_IGNORE_DIV_ZERO_CHECK) == 0;
+    }
+
+    case Instruction::DIV_LONG:
+    case Instruction::REM_LONG:
+    case Instruction::DIV_LONG_2ADDR:
+    case Instruction::REM_LONG_2ADDR: {
+      if (mir->ssa_rep != nullptr) {
+        if (IsConst(mir->ssa_rep->uses[2]) == true && IsConst(mir->ssa_rep->uses[3]) == true) {
+          return ConstantValue(mir->ssa_rep->uses[2]) == 0 && ConstantValue(mir->ssa_rep->uses[3]) == 0;
+        }
+      }
+
+      // We don't know value of denominator but check if it has proven it won't throw.
+      return (mir->optimization_flags & MIR_IGNORE_DIV_ZERO_CHECK) == 0;
+    }
+
+    case Instruction::DIV_INT_LIT16:
+    case Instruction::REM_INT_LIT16:
+    case Instruction::DIV_INT_LIT8:
+    case Instruction::REM_INT_LIT8:
+      return mir->dalvikInsn.vC == 0;
+
+    case Instruction::AGET:
+    case Instruction::AGET_WIDE:
+    case Instruction::AGET_OBJECT:
+    case Instruction::AGET_BOOLEAN:
+    case Instruction::AGET_BYTE:
+    case Instruction::AGET_CHAR:
+    case Instruction::AGET_SHORT:
+    case Instruction::APUT:
+    case Instruction::APUT_WIDE:
+    case Instruction::APUT_OBJECT:
+    case Instruction::APUT_BOOLEAN:
+    case Instruction::APUT_BYTE:
+    case Instruction::APUT_CHAR:
+    case Instruction::APUT_SHORT:
+    case kMirOpPackedArrayGet:
+    case kMirOpPackedArrayPut: {
+      if (opcode == Instruction::APUT_OBJECT) {
+        // Possible call to helper routine for type checking.
+        return true;
+      }
+
+      // No exceptions only if both null and range checks have been eliminated.
+      uint32_t needed_flags = MIR_IGNORE_RANGE_CHECK | MIR_IGNORE_NULL_CHECK;
+      return ((mir->optimization_flags & needed_flags) == needed_flags);
+    }
+
+    case Instruction::IGET:
+    case Instruction::IGET_WIDE:
+    case Instruction::IGET_OBJECT:
+    case Instruction::IGET_BOOLEAN:
+    case Instruction::IGET_BYTE:
+    case Instruction::IGET_CHAR:
+    case Instruction::IGET_SHORT:
+    case Instruction::IPUT:
+    case Instruction::IPUT_WIDE:
+    case Instruction::IPUT_OBJECT:
+    case Instruction::IPUT_BOOLEAN:
+    case Instruction::IPUT_BYTE:
+    case Instruction::IPUT_CHAR:
+    case Instruction::IPUT_SHORT:
+    case Instruction::IGET_QUICK:
+    case Instruction::IGET_WIDE_QUICK:
+    case Instruction::IGET_OBJECT_QUICK:
+    case Instruction::IPUT_QUICK:
+    case Instruction::IPUT_WIDE_QUICK:
+    case Instruction::IPUT_OBJECT_QUICK: {
+      const MirIFieldLoweringInfo& field_info = GetIFieldLoweringInfo(mir);
+      if (field_info.FastGet() || field_info.FastPut()) {
+        return (mir->optimization_flags & MIR_IGNORE_NULL_CHECK) == 0;
+      }
+
+      // Has safepoint because calls runtime helper.
+      return true;
+    }
+
+    case Instruction::ARRAY_LENGTH:
+    case kMirOpNullCheck:
+      // No exceptions only if null check has been eliminated.
+      return (mir->optimization_flags & MIR_IGNORE_NULL_CHECK) == 0;
+
+    default:
+      break;
+  }
+
+  // Returns and branches may also have suspend checks.
+  int flags = mir->dalvikInsn.FlagsOf();
+  if (flags == Instruction::kReturn || mir->dalvikInsn.IsConditionalBranch()
+      || (flags & Instruction::kUnconditional) != 0) {
+    return (mir->optimization_flags & MIR_IGNORE_SUSPEND_CHECK) == 0;
+  }
+
+  // Some of the throwers have already been handled in the special logic which considers
+  // check elimination flags as well.
+  if ((flags & Instruction::kThrow) != 0) {
+    return true;
+  }
+
+  // The throwers have already been captured. It is not expected that anything else will have safepoint.
+  return false;
 }
 
 }  // namespace art

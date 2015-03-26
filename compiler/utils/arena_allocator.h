@@ -57,6 +57,7 @@ enum ArenaAllocKind {
   kArenaAllocData,
   kArenaAllocPredecessors,
   kArenaAllocSTL,
+  kArenaAllocRefMaps,
   kNumArenaAllocKinds
 };
 

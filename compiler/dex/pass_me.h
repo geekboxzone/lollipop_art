@@ -42,7 +42,8 @@ class PassMEDataHolder: public PassDataHolder {
   public:
     CompilationUnit* c_unit;
     BasicBlock* bb;
-    void* data;
+    void* data;               /**< @brief Any data the pass wants to use */
+    bool dirty;               /**< @brief Has the pass rendered the CFG dirty, requiring post-opt? */
 };
 
 enum DataFlowAnalysisMode {
@@ -80,10 +81,74 @@ class PassME: public Pass {
   }
 
   ~PassME() {
+    default_options_.clear();
   }
 
   virtual DataFlowAnalysisMode GetTraversal() const {
     return traversal_type_;
+  }
+
+  /**
+   * @return Returns whether the pass has any configurable options.
+   */
+  bool HasOptions() const {
+    return default_options_.size() != 0;
+  }
+
+  /**
+   * @brief Prints the pass options along with default settings if there are any.
+   * @details The printing is done using LOG(INFO).
+   */
+  void PrintPassDefaultOptions() const {
+    for (auto option_it = default_options_.begin(); option_it != default_options_.end(); option_it++) {
+      LOG(INFO) << "\t" << option_it->first << ":" << option_it->second;
+    }
+  }
+
+  /**
+   * @brief Prints the pass options along with either default or overridden setting.
+   * @param overridden_options The overridden settings for this pass.
+   */
+  void PrintPassOptions(SafeMap<const std::string, const OptionContent>& overridden_options) const {
+    // We walk through the default options only to get the pass names. We use GetPassOption
+    // to also consider the overridden ones.
+    for (auto option_it = default_options_.begin(); option_it != default_options_.end(); option_it++) {
+      LOG(INFO) << "\t" << option_it->first << ":" << GetPassOption(option_it->first, overridden_options);
+    }
+  }
+
+  /**
+   * @brief Used to obtain the option structure for a pass.
+   * @details Will return the overridden option if it exists or default one otherwise.
+   * @param option_name The name of option whose setting to look for.
+   * @param c_unit The compilation unit currently being handled.
+   * @return Returns the option structure containing the option value.
+  */
+  const OptionContent& GetPassOption(const char* option_name, CompilationUnit* c_unit) const {
+    return GetPassOption(option_name, c_unit->overridden_pass_options);
+  }
+
+  /**
+   * @brief Used to obtain the option for a pass as a string.
+   * @details Will return the overridden option if it exists or default one otherwise.
+   * It will fail and exit the program if the required option is not a string.
+   * @param option_name The name of option whose setting to look for.
+   * @param c_unit The compilation unit currently being handled.
+   * @return Returns the overridden option if it exists or the default one otherwise.
+  */
+  const std::string& GetStringPassOption(const char* option_name, CompilationUnit* c_unit) const {
+    return GetStringPassOption(option_name, c_unit->overridden_pass_options);
+  }
+
+  /**
+    * @brief Used to obtain the pass option value as an integer.
+    * @details Will return the overridden option if it exists or default one otherwise.
+    * It will fail and exit the program if the required option is not an integer.
+    * @param c_unit The compilation unit currently being handled.
+    * @return Returns the overriden option if it exists or the default one otherwise.
+   */
+  int64_t GetIntegerPassOption(const char* option_name, CompilationUnit* c_unit) const {
+    return GetIntegerPassOption(option_name, c_unit->overridden_pass_options);
   }
 
   const char* GetDumpCFGFolder() const {
@@ -95,6 +160,42 @@ class PassME: public Pass {
   }
 
  protected:
+  const OptionContent& GetPassOption(const char* option_name,
+                                     const SafeMap<const std::string, const OptionContent>& overridden_options) const {
+    DCHECK(option_name != nullptr);
+
+    // First check if there are any overridden settings.
+    auto overridden_it = overridden_options.find(std::string(option_name));
+    if (overridden_it != overridden_options.end()) {
+      return overridden_it->second;
+    } else {
+      // Otherwise, there must be a default value for this option name.
+      auto default_it = default_options_.find(option_name);
+      // An invalid option is being requested.
+      if (default_it == default_options_.end()) {
+        LOG(FATAL) << "Fatal: Cannot find an option named \"" << option_name << "\"";
+      }
+
+      return default_it->second;
+    }
+  }
+
+  const std::string& GetStringPassOption(const char* option_name,
+                           const SafeMap<const std::string, const OptionContent>& overridden_options) const {
+    const OptionContent& option_content = GetPassOption(option_name, overridden_options);
+    CHECK(option_content.type == OptionContent::STRING);
+
+    return option_content.container.s;
+  }
+
+  int64_t GetIntegerPassOption(const char* option_name,
+                            const SafeMap<const std::string, const OptionContent>& overridden_options) const {
+    const OptionContent& option_content = GetPassOption(option_name, overridden_options);
+    CHECK(option_content.type == OptionContent::INTEGER);
+
+    return option_content.container.i;
+  }
+
   /** @brief Type of traversal: determines the order to execute the pass on the BasicBlocks. */
   const DataFlowAnalysisMode traversal_type_;
 
@@ -103,6 +204,13 @@ class PassME: public Pass {
 
   /** @brief CFG Dump Folder: what sub-folder to use for dumping the CFGs post pass. */
   const char* const dump_cfg_folder_;
+
+  /**
+   * @brief Contains a map of options with the default settings.
+   * @details The constructor of the specific pass instance should fill this
+   * with default options.
+   * */
+  SafeMap<const char*, const OptionContent> default_options_;
 };
 }  // namespace art
 #endif  // ART_COMPILER_DEX_PASS_ME_H_

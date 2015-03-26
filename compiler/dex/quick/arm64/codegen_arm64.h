@@ -19,6 +19,7 @@
 
 #include "arm64_lir.h"
 #include "dex/compiler_internals.h"
+#include "dex/quick/mir_to_lir.h"
 
 #include <map>
 
@@ -140,13 +141,13 @@ class Arm64Mir2Lir FINAL : public Mir2Lir {
   void GenShiftOpLong(Instruction::Code opcode, RegLocation rl_dest, RegLocation rl_src1,
                       RegLocation lr_shift) OVERRIDE;
   void GenArithImmOpLong(Instruction::Code opcode, RegLocation rl_dest, RegLocation rl_src1,
-                         RegLocation rl_src2) OVERRIDE;
+                         RegLocation rl_src2, int flags) OVERRIDE;
   void GenArrayGet(int opt_flags, OpSize size, RegLocation rl_array, RegLocation rl_index,
                    RegLocation rl_dest, int scale) OVERRIDE;
   void GenArrayPut(int opt_flags, OpSize size, RegLocation rl_array, RegLocation rl_index,
                    RegLocation rl_src, int scale, bool card_mark) OVERRIDE;
   void GenShiftImmOpLong(Instruction::Code opcode, RegLocation rl_dest, RegLocation rl_src1,
-                         RegLocation rl_shift) OVERRIDE;
+                         RegLocation rl_shift, int flags) OVERRIDE;
   void GenArithOpDouble(Instruction::Code opcode, RegLocation rl_dest, RegLocation rl_src1,
                         RegLocation rl_src2) OVERRIDE;
   void GenArithOpFloat(Instruction::Code opcode, RegLocation rl_dest, RegLocation rl_src1,
@@ -171,7 +172,7 @@ class Arm64Mir2Lir FINAL : public Mir2Lir {
   bool GenInlinedArrayCopyCharArray(CallInfo* info) OVERRIDE;
   void GenIntToLong(RegLocation rl_dest, RegLocation rl_src) OVERRIDE;
   void GenArithOpLong(Instruction::Code opcode, RegLocation rl_dest, RegLocation rl_src1,
-                      RegLocation rl_src2) OVERRIDE;
+                      RegLocation rl_src2, int flags) OVERRIDE;
   RegLocation GenDivRem(RegLocation rl_dest, RegStorage reg_lo, RegStorage reg_hi, bool is_div)
       OVERRIDE;
   RegLocation GenDivRemLit(RegLocation rl_dest, RegStorage reg_lo, int lit, bool is_div)
@@ -181,7 +182,7 @@ class Arm64Mir2Lir FINAL : public Mir2Lir {
   void GenEntrySequence(RegLocation* ArgLocs, RegLocation rl_method) OVERRIDE;
   void GenExitSequence() OVERRIDE;
   void GenSpecialExitSequence() OVERRIDE;
-  void GenFillArrayData(DexOffset table_offset, RegLocation rl_src) OVERRIDE;
+  void GenFillArrayData(MIR* mir, DexOffset table_offset, RegLocation rl_src) OVERRIDE;
   void GenFusedFPCmpBranch(BasicBlock* bb, MIR* mir, bool gt_bias, bool is_double) OVERRIDE;
   void GenFusedLongCmpBranch(BasicBlock* bb, MIR* mir) OVERRIDE;
   void GenSelect(BasicBlock* bb, MIR* mir) OVERRIDE;
@@ -340,8 +341,8 @@ class Arm64Mir2Lir FINAL : public Mir2Lir {
   void InsertFixupBefore(LIR* prev_lir, LIR* orig_lir, LIR* new_lir);
   void AssignDataOffsets();
   RegLocation GenDivRem(RegLocation rl_dest, RegLocation rl_src1, RegLocation rl_src2,
-                        bool is_div, bool check_zero);
-  RegLocation GenDivRemLit(RegLocation rl_dest, RegLocation rl_src1, int lit, bool is_div);
+                        bool is_div, int flags) OVERRIDE;
+  RegLocation GenDivRemLit(RegLocation rl_dest, RegLocation rl_src1, int lit, bool is_div) OVERRIDE;
   size_t GetLoadStoreSize(LIR* lir);
 
   bool SmallLiteralDivRem64(Instruction::Code dalvik_opcode, bool is_div, RegLocation rl_src,
@@ -390,7 +391,7 @@ class Arm64Mir2Lir FINAL : public Mir2Lir {
   void GenNotLong(RegLocation rl_dest, RegLocation rl_src);
   void GenNegLong(RegLocation rl_dest, RegLocation rl_src);
   void GenDivRemLong(Instruction::Code opcode, RegLocation rl_dest, RegLocation rl_src1,
-                     RegLocation rl_src2, bool is_div);
+                     RegLocation rl_src2, bool is_div, int flags);
 
   InToRegStorageMapping in_to_reg_storage_mapping_;
   static const ArmEncodingMap EncodingMap[kA64Last];

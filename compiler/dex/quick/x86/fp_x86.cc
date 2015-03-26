@@ -21,6 +21,29 @@
 
 namespace art {
 
+#define INLINED_EXTRA_MATH_1ARG(FUNC_NAME) \
+bool X86Mir2Lir::GenInlined##FUNC_NAME(CallInfo* info) { \
+  FlushAllRegs(); \
+  RegLocation rl_src = info->args[0]; \
+  RegLocation rl_dest = InlineTargetWide(info); \
+  CallRuntimeHelperRegLocation(QuickEntrypointEnum::kQuick##FUNC_NAME, rl_src, false); \
+  RegLocation rl_result = GetReturnWide(kFPReg); \
+  StoreFinalValueWide(rl_dest, rl_result); \
+  return true; \
+}
+
+#define INLINED_EXTRA_MATH_2ARG(FUNC_NAME) \
+bool X86Mir2Lir::GenInlined##FUNC_NAME(CallInfo* info) { \
+  FlushAllRegs(); \
+  RegLocation rl_src1 = LoadValueWide(info->args[0], kFPReg); \
+  RegLocation rl_src2 = LoadValueWide(info->args[2], kFPReg); \
+  RegLocation rl_dest = InlineTargetWide(info); \
+  CallRuntimeHelperRegLocationRegLocation(QuickEntrypointEnum::kQuick##FUNC_NAME, rl_src1, rl_src2, false); \
+  RegLocation rl_result = GetReturnWide(kFPReg); \
+  StoreFinalValueWide(rl_dest, rl_result); \
+  return true; \
+}
+
 void X86Mir2Lir::GenArithOpFloat(Instruction::Code opcode,
                                  RegLocation rl_dest, RegLocation rl_src1, RegLocation rl_src2) {
   X86OpCode op = kX86Nop;
@@ -569,23 +592,27 @@ void X86Mir2Lir::GenNegFloat(RegLocation rl_dest, RegLocation rl_src) {
 void X86Mir2Lir::GenNegDouble(RegLocation rl_dest, RegLocation rl_src) {
   RegLocation rl_result;
   rl_src = LoadValueWide(rl_src, kCoreReg);
-  rl_result = EvalLocWide(rl_dest, kCoreReg, true);
   if (cu_->target64) {
+    rl_result = EvalLocWide(rl_dest, kCoreReg, true);
     OpRegCopy(rl_result.reg, rl_src.reg);
     // Flip sign bit.
     NewLIR2(kX86Rol64RI, rl_result.reg.GetReg(), 1);
     NewLIR2(kX86Xor64RI, rl_result.reg.GetReg(), 1);
     NewLIR2(kX86Ror64RI, rl_result.reg.GetReg(), 1);
   } else {
-    OpRegRegImm(kOpAdd, rl_result.reg.GetHigh(), rl_src.reg.GetHigh(), 0x80000000);
-    OpRegCopy(rl_result.reg, rl_src.reg);
+    rl_result = ForceTempWide(rl_src);
+    OpRegRegImm(kOpAdd, rl_result.reg.GetHigh(), rl_result.reg.GetHigh(), 0x80000000);
   }
   StoreValueWide(rl_dest, rl_result);
 }
 
 bool X86Mir2Lir::GenInlinedSqrt(CallInfo* info) {
-  RegLocation rl_src = info->args[0];
   RegLocation rl_dest = InlineTargetWide(info);  // double place for result
+  if (rl_dest.s_reg_low == INVALID_SREG) {
+    // Result is unused, the code is dead. Inlining successful, no code generated.
+    return true;
+  }
+  RegLocation rl_src = info->args[0];
   rl_src = LoadValueWide(rl_src, kFPReg);
   RegLocation rl_result = EvalLoc(rl_dest, kFPReg, true);
   NewLIR2(kX86SqrtsdRR, rl_result.reg.GetReg(), rl_src.reg.GetReg());
@@ -707,9 +734,13 @@ bool X86Mir2Lir::GenInlinedAbsDouble(CallInfo* info) {
 
 bool X86Mir2Lir::GenInlinedMinMaxFP(CallInfo* info, bool is_min, bool is_double) {
   if (is_double) {
+    RegLocation rl_dest = InlineTargetWide(info);
+    if (rl_dest.s_reg_low == INVALID_SREG) {
+      // Result is unused, the code is dead. Inlining successful, no code generated.
+      return true;
+    }
     RegLocation rl_src1 = LoadValueWide(info->args[0], kFPReg);
     RegLocation rl_src2 = LoadValueWide(info->args[2], kFPReg);
-    RegLocation rl_dest = InlineTargetWide(info);
     RegLocation rl_result = EvalLocWide(rl_dest, kFPReg, true);
 
     // Avoid src2 corruption by OpRegCopyWide.
@@ -730,6 +761,25 @@ bool X86Mir2Lir::GenInlinedMinMaxFP(CallInfo* info, bool is_min, bool is_double)
     // Handle NaN.
     branch_nan->target = NewLIR0(kPseudoTargetLabel);
     LoadConstantWide(rl_result.reg, INT64_C(0x7ff8000000000000));
+
+    // The base_of_code_ compiler temp is non-null when it is reserved
+    // for being able to do data accesses relative to method start.
+    if (base_of_code_ != nullptr) {
+      // Loading from the constant pool may have used base of code register.
+      // However, the code here generates logic in diamond shape and not all
+      // paths load base of code register. Therefore, we ensure it is clobbered so
+      // that the temp caching system does not believe it is live at merge point.
+      RegLocation rl_method = mir_graph_->GetRegLocation(base_of_code_->s_reg_low);
+      if (rl_method.wide) {
+        rl_method = UpdateLocWide(rl_method);
+      } else {
+        rl_method = UpdateLoc(rl_method);
+      }
+      if (rl_method.location == kLocPhysReg) {
+        Clobber(rl_method.reg);
+      }
+    }
+
     LIR* branch_exit_nan = NewLIR1(kX86Jmp8, 0);
     // Handle Min/Max. Copy greater/lesser value from src2.
     branch_cond1->target = NewLIR0(kPseudoTargetLabel);
@@ -741,9 +791,13 @@ bool X86Mir2Lir::GenInlinedMinMaxFP(CallInfo* info, bool is_min, bool is_double)
     branch_exit_equal->target = NewLIR0(kPseudoTargetLabel);
     StoreValueWide(rl_dest, rl_result);
   } else {
+    RegLocation rl_dest = InlineTarget(info);
+    if (rl_dest.s_reg_low == INVALID_SREG) {
+      // Result is unused, the code is dead. Inlining successful, no code generated.
+      return true;
+    }
     RegLocation rl_src1 = LoadValue(info->args[0], kFPReg);
     RegLocation rl_src2 = LoadValue(info->args[1], kFPReg);
-    RegLocation rl_dest = InlineTarget(info);
     RegLocation rl_result = EvalLoc(rl_dest, kFPReg, true);
 
     // Avoid src2 corruption by OpRegCopyWide.
@@ -778,4 +832,27 @@ bool X86Mir2Lir::GenInlinedMinMaxFP(CallInfo* info, bool is_min, bool is_double)
   return true;
 }
 
+INLINED_EXTRA_MATH_1ARG(Cos)
+INLINED_EXTRA_MATH_1ARG(Sin)
+INLINED_EXTRA_MATH_1ARG(Acos)
+INLINED_EXTRA_MATH_1ARG(Asin)
+INLINED_EXTRA_MATH_1ARG(Atan)
+INLINED_EXTRA_MATH_2ARG(Atan2)
+INLINED_EXTRA_MATH_1ARG(Cbrt)
+INLINED_EXTRA_MATH_1ARG(Ceil)
+INLINED_EXTRA_MATH_1ARG(Cosh)
+INLINED_EXTRA_MATH_1ARG(Exp)
+INLINED_EXTRA_MATH_1ARG(Expm1)
+INLINED_EXTRA_MATH_1ARG(Floor)
+INLINED_EXTRA_MATH_2ARG(Hypot)
+INLINED_EXTRA_MATH_1ARG(Log)
+INLINED_EXTRA_MATH_1ARG(Log10)
+INLINED_EXTRA_MATH_2ARG(NextAfter)
+INLINED_EXTRA_MATH_1ARG(Rint)
+INLINED_EXTRA_MATH_1ARG(Sinh)
+INLINED_EXTRA_MATH_1ARG(Tan)
+INLINED_EXTRA_MATH_1ARG(Tanh)
+
+#undef INLINED_EXTRA_MATH_1ARG
+#undef INLINED_EXTRA_MATH_2ARG
 }  // namespace art

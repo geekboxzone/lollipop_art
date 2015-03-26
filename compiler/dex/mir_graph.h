@@ -19,9 +19,10 @@
 
 #include <stdint.h>
 
+#include "compiler_ir.h"
 #include "dex_file.h"
 #include "dex_instruction.h"
-#include "compiler_ir.h"
+#include "driver/dex_compilation_unit.h"
 #include "invoke_type.h"
 #include "mir_field_info.h"
 #include "mir_method_info.h"
@@ -189,11 +190,14 @@ enum OatMethodAttributes {
 #define MIR_IGNORE_RANGE_CHECK          (1 << kMIRIgnoreRangeCheck)
 #define MIR_RANGE_CHECK_ONLY            (1 << kMIRRangeCheckOnly)
 #define MIR_IGNORE_CLINIT_CHECK         (1 << kMIRIgnoreClInitCheck)
+#define MIR_IGNORE_DIV_ZERO_CHECK       (1 << kMirIgnoreDivZeroCheck)
 #define MIR_INLINED                     (1 << kMIRInlined)
 #define MIR_INLINED_PRED                (1 << kMIRInlinedPred)
 #define MIR_CALLEE                      (1 << kMIRCallee)
 #define MIR_IGNORE_SUSPEND_CHECK        (1 << kMIRIgnoreSuspendCheck)
 #define MIR_DUP                         (1 << kMIRDup)
+#define MIR_MARK                        (1 << kMIRMark)
+#define MIR_STORE_NON_TEMPORAL          (1 << kMIRStoreNonTemporal)
 
 #define BLOCK_NAME_LEN 80
 
@@ -215,6 +219,7 @@ struct CompilerTemp {
 enum CompilerTempType {
   kCompilerTempVR,                // A virtual register temporary.
   kCompilerTempSpecialMethodPtr,  // Temporary that keeps track of current method pointer.
+  kCompilerTempBackend,           // Temporary that is used by backend.
 };
 
 // When debug option enabled, records effectiveness of null and range check elimination.
@@ -297,37 +302,37 @@ struct MIR {
     }
 
     bool IsInvoke() const {
-      return !IsPseudoMirOp(opcode) && ((Instruction::FlagsOf(opcode) & Instruction::kInvoke) == Instruction::kInvoke);
+      return ((FlagsOf() & Instruction::kInvoke) == Instruction::kInvoke);
     }
 
     bool IsStore() const {
-      return !IsPseudoMirOp(opcode) && ((Instruction::FlagsOf(opcode) & Instruction::kStore) == Instruction::kStore);
+      return ((FlagsOf() & Instruction::kStore) == Instruction::kStore);
     }
 
     bool IsLoad() const {
-      return !IsPseudoMirOp(opcode) && ((Instruction::FlagsOf(opcode) & Instruction::kLoad) == Instruction::kLoad);
+      return ((FlagsOf() & Instruction::kLoad) == Instruction::kLoad);
     }
 
     bool IsConditionalBranch() const {
-      return !IsPseudoMirOp(opcode) && (Instruction::FlagsOf(opcode) == (Instruction::kContinue | Instruction::kBranch));
+      return (FlagsOf() == (Instruction::kContinue | Instruction::kBranch));
     }
 
     /**
      * @brief Is the register C component of the decoded instruction a constant?
      */
     bool IsCFieldOrConstant() const {
-      return !IsPseudoMirOp(opcode) && ((Instruction::FlagsOf(opcode) & Instruction::kRegCFieldOrConstant) == Instruction::kRegCFieldOrConstant);
+      return ((FlagsOf() & Instruction::kRegCFieldOrConstant) == Instruction::kRegCFieldOrConstant);
     }
 
     /**
      * @brief Is the register C component of the decoded instruction a constant?
      */
     bool IsBFieldOrConstant() const {
-      return !IsPseudoMirOp(opcode) && ((Instruction::FlagsOf(opcode) & Instruction::kRegBFieldOrConstant) == Instruction::kRegBFieldOrConstant);
+      return ((FlagsOf() & Instruction::kRegBFieldOrConstant) == Instruction::kRegBFieldOrConstant);
     }
 
     bool IsCast() const {
-      return !IsPseudoMirOp(opcode) && ((Instruction::FlagsOf(opcode) & Instruction::kCast) == Instruction::kCast);
+      return ((FlagsOf() & Instruction::kCast) == Instruction::kCast);
     }
 
     /**
@@ -337,12 +342,14 @@ struct MIR {
      *            when crossing such an instruction.
      */
     bool Clobbers() const {
-      return !IsPseudoMirOp(opcode) && ((Instruction::FlagsOf(opcode) & Instruction::kClobber) == Instruction::kClobber);
+      return ((FlagsOf() & Instruction::kClobber) == Instruction::kClobber);
     }
 
     bool IsLinear() const {
-      return !IsPseudoMirOp(opcode) && (Instruction::FlagsOf(opcode) & (Instruction::kAdd | Instruction::kSubtract)) != 0;
+      return (FlagsOf() & (Instruction::kAdd | Instruction::kSubtract)) != 0;
     }
+
+    int FlagsOf() const;
   } dalvikInsn;
 
   NarrowDexOffset offset;         // Offset of the instruction in code units.
@@ -539,7 +546,20 @@ const RegLocation bad_loc = {kLocDalvikFrame, 0, 0, 0, 0, 0, 0, 0, 0, RegStorage
 class MIRGraph {
  public:
   MIRGraph(CompilationUnit* cu, ArenaAllocator* arena);
-  ~MIRGraph();
+  virtual ~MIRGraph();
+
+  static MIRGraph* CreateMIRGraph(CompilationUnit* c_unit) {
+    if (plugin_create_mir_graph_ == nullptr) {
+      return new MIRGraph(c_unit, &(c_unit->arena));
+    } else {
+      return plugin_create_mir_graph_(c_unit);
+    }
+  }
+
+  typedef MIRGraph* (*MIRGraphFctPtr)(CompilationUnit*);
+  static void SetPluginCreateMirGraph(MIRGraphFctPtr fct) {
+    plugin_create_mir_graph_ = fct;
+  }
 
   /*
    * Examine the graph to determine whether it's worthwile to spend the time compiling
@@ -569,17 +589,49 @@ class MIRGraph {
     return current_code_item_->insns_;
   }
 
+  /**
+   * @brief Used to obtain the raw dex bytecode instruction pointer.
+   * @param m_unit_index The method index in MIRGraph (caused by having multiple methods).
+   * This is guaranteed to contain index 0 which is the base method being compiled.
+   * @return Returns the raw instruction pointer.
+   */
   const uint16_t* GetInsns(int m_unit_index) const {
     return m_units_[m_unit_index]->GetCodeItem()->insns_;
+  }
+
+  /**
+   * @brief Used to obtain the raw data table.
+   * @param mir sparse switch, packed switch, of fill-array-data
+   * @param table_offset The table offset from start of method.
+   * @return Returns the raw table pointer.
+   */
+  const uint16_t* GetTable(MIR* mir, uint32_t table_offset) const {
+    return GetInsns(mir->m_unit_index) + mir->offset + table_offset;
   }
 
   unsigned int GetNumBlocks() const {
     return num_blocks_;
   }
 
-  size_t GetNumDalvikInsns() const {
-    return cu_->code_item->insns_size_in_code_units_;
-  }
+  /**
+   * @brief Provides the total size in code units of all instructions in MIRGraph.
+   * @details Includes the sizes of all methods in compilation unit.
+   * @return Returns the cumulative sum of all insn sizes (in code units).
+   */
+  virtual size_t GetNumDalvikInsns() const;
+
+  /**
+   * @brief Used to provide a new, non-overlapping offset for instruction.
+   * @details For now, implementation assumes that each offset it reserves space
+   * for is 2 code units in size (the size of smallest instruction). Another
+   * approach is to allocate as per the dex size as dictated by encoding. However,
+   * since offsets are simply used as for disambiguation, we do not have to
+   * be strict about this.
+   * @param opcode The opcode to provide offset for.
+   * @return Returns a dex offset that does not overlap any others. This is guaranteed
+   * as long as everyone uses this interface.
+   */
+  virtual DexOffset GetNewOffset();
 
   ArenaBitVector* GetTryBlockAddr() const {
     return try_block_addr_;
@@ -636,13 +688,18 @@ class MIRGraph {
     return m_units_[current_method_];
   }
 
+  DexCompilationUnit* GetDexCompilationUnit(uint16_t m_unit_index) const {
+    return m_units_[m_unit_index];
+  }
+
   /**
    * @brief Dump a CFG into a dot file format.
    * @param dir_prefix the directory the file will be created in.
    * @param all_blocks does the dumper use all the basic blocks or use the reachable blocks.
    * @param suffix does the filename require a suffix or not (default = nullptr).
+   * @param filename required file name.
    */
-  void DumpCFG(const char* dir_prefix, bool all_blocks, const char* suffix = nullptr);
+  void DumpCFG(const char* dir_prefix, bool all_blocks, const char* suffix = nullptr, const char* filename = nullptr);
 
   bool HasFieldAccess() const {
     return (merged_df_flags_ & (DF_IFIELD | DF_SFIELD)) != 0u;
@@ -724,6 +781,19 @@ class MIRGraph {
     return constant_values_[s_reg];
   }
 
+  /**
+   * @brief Used to obtain 64-bit value of a pair of ssa registers.
+   * @param s_reg_low The ssa register representing the low bits.
+   * @param s_reg_high The ssa register representing the high bits.
+   * @return Retusn the 64-bit constant value.
+   */
+  int64_t ConstantValueWide(int32_t s_reg_low, int32_t s_reg_high) const {
+    DCHECK(IsConst(s_reg_low));
+    DCHECK(IsConst(s_reg_high));
+    return (static_cast<int64_t>(constant_values_[s_reg_high]) << 32) |
+        Low32Bits(static_cast<int64_t>(constant_values_[s_reg_low]));
+  }
+
   int64_t ConstantValueWide(RegLocation loc) const {
     DCHECK(IsConst(loc));
     DCHECK(!loc.high_word);  // Do not allow asking for the high partner.
@@ -731,6 +801,20 @@ class MIRGraph {
     return (static_cast<int64_t>(constant_values_[loc.orig_sreg + 1]) << 32) |
         Low32Bits(static_cast<int64_t>(constant_values_[loc.orig_sreg]));
   }
+
+  /**
+   * @brief Used to mark ssa register as being constant.
+   * @param ssa_reg The ssa register.
+   * @param value The constant value of ssa register.
+   */
+  void SetConstant(int32_t ssa_reg, int32_t value);
+
+  /**
+   * @brief Used to mark ssa register and its wide counter-part as being constant.
+   * @param ssa_reg The ssa register.
+   * @param value The 64-bit constant value of ssa register and its pair.
+   */
+  void SetConstantWide(int32_t ssa_reg, int64_t value);
 
   bool IsConstantNullRef(RegLocation loc) const {
     return loc.ref && loc.is_const && (ConstantValue(loc) == 0);
@@ -754,12 +838,12 @@ class MIRGraph {
     return num_reachable_blocks_;
   }
 
-  int GetUseCount(int vreg) const {
-    return use_counts_.Get(vreg);
+  int GetUseCount(int sreg) const {
+    return use_counts_.Get(sreg);
   }
 
-  int GetRawUseCount(int vreg) const {
-    return raw_use_counts_.Get(vreg);
+  int GetRawUseCount(int sreg) const {
+    return raw_use_counts_.Get(sreg);
   }
 
   int GetSSASubscript(int ssa_reg) const {
@@ -815,9 +899,26 @@ class MIRGraph {
    * @return Returns the number of compiler temporaries.
    */
   size_t GetNumUsedCompilerTemps() const {
-    size_t total_num_temps = compiler_temps_.Size();
-    DCHECK_LE(num_non_special_compiler_temps_, total_num_temps);
-    return total_num_temps;
+    // Assume that the special temps will always be used.
+    return GetNumNonSpecialCompilerTemps() + max_available_special_compiler_temps_;
+  }
+
+  /**
+   * @brief Used to obtain number of bytes needed for special temps.
+   * @details This space is always needed because temps have special location on stack.
+   * @return Returns number of bytes for the special temps.
+   */
+  size_t GetNumBytesForSpecialTemps() const;
+
+  /**
+   * @brief Used by backend as a hint for maximum number of bytes for non-special temps.
+   * @details Returns 4 bytes for each temp because that is the maximum amount needed
+   * for storing each temp. The BE could be smarter though and allocate a smaller
+   * spill region.
+   * @return Returns the maximum number of bytes needed for non-special temps.
+   */
+  size_t GetMaximumBytesForNonSpecialTemps() const {
+    return GetNumNonSpecialCompilerTemps() * sizeof(uint32_t);
   }
 
   /**
@@ -835,7 +936,9 @@ class MIRGraph {
    * @return Returns true if the max was set and false if failed to set.
    */
   bool SetMaxAvailableNonSpecialCompilerTemps(size_t new_max) {
-    if (new_max < GetNumNonSpecialCompilerTemps()) {
+    // Make sure that enough temps still exist for backend and also that the
+    // new max can still keep around all of the already requested temps.
+    if (new_max < (GetNumNonSpecialCompilerTemps() + reserved_temps_for_backend_)) {
       return false;
     } else {
       max_available_non_special_compiler_temps_ = new_max;
@@ -844,21 +947,12 @@ class MIRGraph {
   }
 
   /**
-   * @brief Provides the number of non-special compiler temps available.
+   * @brief Provides the number of non-special compiler temps available for use by ME.
    * @details Even if this returns zero, special compiler temps are guaranteed to be available.
+   * Additionally, this makes sure to not use any temps reserved for BE only.
    * @return Returns the number of available temps.
    */
-  size_t GetNumAvailableNonSpecialCompilerTemps();
-
-  /**
-   * @brief Used to obtain an existing compiler temporary.
-   * @param index The index of the temporary which must be strictly less than the
-   * number of temporaries.
-   * @return Returns the temporary that was asked for.
-   */
-  CompilerTemp* GetCompilerTemp(size_t index) const {
-    return compiler_temps_.Get(index);
-  }
+  size_t GetNumAvailableVRTemps();
 
   /**
    * @brief Used to obtain the maximum number of compiler temporaries that can be requested.
@@ -869,7 +963,22 @@ class MIRGraph {
   }
 
   /**
+   * @brief Used to signal that the compiler temps have been committed.
+   * @details This should be used once the number of temps can no longer change,
+   * such as after frame size is committed and cannot be changed.
+   */
+  void CommitCompilerTemps() {
+    compiler_temps_committed_ = true;
+  }
+
+  /**
    * @brief Used to obtain a new unique compiler temporary.
+   * @details Two things are done for convenience when allocating a new compiler
+   * temporary. The ssa register is automatically requested and the information
+   * about reg location is filled. This helps when the temp is requested post
+   * ssa initialization, such as when temps are requested by the backend.
+   * @warning If the temp requested will be used for ME and have multiple versions,
+   * the sreg provided by the temp will be invalidated on next ssa recalculation.
    * @param ct_type Type of compiler temporary requested.
    * @param wide Whether we should allocate a wide temporary.
    * @return Returns the newly created compiler temporary.
@@ -911,8 +1020,49 @@ class MIRGraph {
   }
 
   // Is this vreg in the in set?
-  bool IsInVReg(int vreg) {
-    return (vreg >= cu_->num_regs);
+  bool IsInVReg(uint32_t vreg) {
+    return (vreg >= GetFirstInVR()) && (vreg < GetFirstTempVR());
+  }
+
+  uint32_t GetNumOfCodeVRs() const {
+    return current_code_item_->registers_size_;
+  }
+
+  uint32_t GetNumOfCodeAndTempVRs() const {
+    // Include all of the possible temps so that no structures overflow when initialized.
+    return GetNumOfCodeVRs() + GetMaxPossibleCompilerTemps();
+  }
+
+  uint32_t GetNumOfLocalCodeVRs() const {
+    // This also refers to the first "in" VR.
+    return GetNumOfCodeVRs() - current_code_item_->ins_size_;
+  }
+
+  uint32_t GetNumOfInVRs() const {
+    return current_code_item_->ins_size_;
+  }
+
+  uint32_t GetNumOfOutVRs() const {
+    return current_code_item_->outs_size_;
+  }
+
+  uint32_t GetFirstInVR() const {
+    return GetNumOfLocalCodeVRs();
+  }
+
+  uint32_t GetFirstTempVR() const {
+    // Temp VRs immediately follow code VRs.
+    return GetNumOfCodeVRs();
+  }
+
+  uint32_t GetFirstSpecialTempVR() const {
+    // Special temps appear first in the ordering before non special temps.
+    return GetFirstTempVR();
+  }
+
+  uint32_t GetFirstNonSpecialTempVR() const {
+    // We always leave space for all the special temps before the non-special ones.
+    return GetFirstSpecialTempVR() + max_available_special_compiler_temps_;
   }
 
   void DumpCheckStats();
@@ -920,9 +1070,10 @@ class MIRGraph {
   int SRegToVReg(int ssa_reg) const;
   void VerifyDataflow();
   void CheckForDominanceFrontier(BasicBlock* dom_bb, const BasicBlock* succ_bb);
-  void EliminateNullChecksAndInferTypesStart();
-  bool EliminateNullChecksAndInferTypes(BasicBlock* bb);
-  void EliminateNullChecksAndInferTypesEnd();
+  bool EliminateNullChecksGate();
+  bool EliminateNullChecks(BasicBlock* bb);
+  void EliminateNullChecksEnd();
+  bool InferTypes(BasicBlock* bb);
   bool EliminateClassInitChecksGate();
   bool EliminateClassInitChecks(BasicBlock* bb);
   void EliminateClassInitChecksEnd();
@@ -965,6 +1116,7 @@ class MIRGraph {
     punt_to_interpreter_ = val;
   }
 
+  void DisassembleExtendedInstr(const MIR* mir, std::string* decoded_mir);
   char* GetDalvikDisassembly(const MIR* mir);
   void ReplaceSpecialChars(std::string& str);
   std::string GetSSAName(int ssa_reg);
@@ -974,7 +1126,8 @@ class MIRGraph {
   void DumpMIRGraph();
   CallInfo* NewMemCallInfo(BasicBlock* bb, MIR* mir, InvokeType type, bool is_range);
   BasicBlock* NewMemBB(BBType block_type, int block_id);
-  MIR* NewMIR();
+  virtual MIR* NewMIR();
+  virtual BasicBlock* CreateBasicBlock();
   MIR* AdvanceMIR(BasicBlock** p_bb, MIR* mir);
   BasicBlock* NextDominatedBlock(BasicBlock* bb);
   bool LayoutBlocks(BasicBlock* bb);
@@ -1044,6 +1197,7 @@ class MIRGraph {
   void ComputeDefBlockMatrix();
   void ComputeDominators();
   void CompilerInitializeSSAConversion();
+  virtual void InitializeBasicBlockDataFlow();
   void InsertPhiNodes();
   void DoDFSPreOrderSSARename(BasicBlock* block);
 
@@ -1077,6 +1231,91 @@ class MIRGraph {
    */
   bool HasSuspendTestBetween(BasicBlock* source, BasicBlockId target_id);
 
+  /**
+   * @brief Used to record a new GC map for a specific MIR.
+   * @param mir The MIR for which to record the GC map.
+   * @param gc_bit_map The new GC map. The caller must ensure that the provided
+   * ArenaBitVector is not deallocated since this method saved the pointer to
+   * it internally.
+   */
+  virtual void RecordNewMirGCMap(MIR* mir, ArenaBitVector* gc_bit_map);
+
+  /**
+   * @details Since this method wants to provide valid size, it makes sure that
+   * it expands the maps to be size of the biggest entry in current compiler
+   * generated maps and the verifier maps.
+   * @return Returns the size in bytes of GC map entry (one entry for each offset).
+   */
+  virtual size_t GetGCMapEntrySize();
+
+  /**
+   * @brief Used to get the GC map for a specific offset.
+   * @param offset The offset for which to get the GC map.
+   * @param verifier_map_as_backup Whether verifier generated map should be used
+   * for backup.
+   * @return Returns the pointer to the GC map. Size should be checked via
+   * GetGCMapEntrySize.
+   */
+  virtual const uint8_t* GetGCMap(DexOffset offset, bool verifier_map_as_backup);
+
+  /**
+   * @brief Used to get the GC map for a specific offset as a BitVector.
+   * @param offset The offset for which to get the GC map.
+   * @return Returns the BitVector representing the GC map. Return nullptr if
+   * there is no GC map for this offset.
+   */
+  virtual const ArenaBitVector* GetGCMapAsBitVector(DexOffset offset);
+
+  /**
+   * @brief Used to check whether ssa register holds object.
+   * @details This requires that type inference pass has already been run.
+   * @param mir_graph The MIRGraph.
+   * @param ssa_reg The ssa register to check if holds object.
+   * @return Returns true if reference and false otherwise.
+   */
+  virtual bool IsObjectRegister(int32_t ssa_reg) {
+    DCHECK(reg_location_ != nullptr);
+    return reg_location_[ssa_reg].ref != 0;
+  }
+
+  /**
+   * @brief Used to check whether the compiler should regenerate GC maps
+   * (instead of using verifier ones).
+   * @return Returns true if GC maps need recalculated.
+   */
+  virtual bool NeedGcMapRecalculation() const {
+    return recalculate_gc_maps_;
+  }
+
+  /**
+   * @brief Used to control the need for GC map recalculation
+   * @details For example, when moving around object references, we need
+   * to regenerate new maps and thus new_state passed in should be true.
+   * @param new_state Whether or not GC maps need recalculated. It is recommended
+   * that callers of this only call with true and let the GC map calculator
+   * call with false when it actually updated all of the new maps.
+   */
+  virtual void ChangeGCMapRecalculationState(bool new_state) {
+    recalculate_gc_maps_ = new_state;
+  }
+
+  /**
+   * @brief Used to gate optimizations that want to move instructions across safepoints.
+   */
+  virtual bool IsCodeMotionAcrossSafepointAllowed() const;
+
+  /**
+   * @brief Used to check whether an instruction might end up generating a safepoint
+   * (captures suspend points, exceptions, method calls).
+   * @details The implementation uses a series of heuristics to report whether it has safepoint.
+   * For example, it knows that if the instruction has been marked with no exceptions, then it
+   * won't throw at that point. No throw means no safepoint needed.
+   * @param mir The instruction to check.
+   * @return Returns true if the backend may end up generating safepoint. Returns false
+   * when it is guaranteed not to generate one.
+   */
+  virtual bool HasSafepoint(MIR* mir) const;
+
  protected:
   int FindCommonParent(int block1, int block2);
   void ComputeSuccLineIn(ArenaBitVector* dest, const ArenaBitVector* src1,
@@ -1088,7 +1327,6 @@ class MIRGraph {
                       ArenaBitVector* live_in_v,
                       const MIR::DecodedInstruction& d_insn);
   bool DoSSAConversion(BasicBlock* bb);
-  bool InvokeUsesMethodStar(MIR* mir);
   int ParseInsn(const uint16_t* code_ptr, MIR::DecodedInstruction* decoded_instruction);
   bool ContentIsInsn(const uint16_t* code_ptr);
   BasicBlock* SplitBlock(DexOffset code_offset, BasicBlock* orig_block,
@@ -1116,8 +1354,6 @@ class MIRGraph {
   void MarkPreOrder(BasicBlock* bb);
   void RecordDFSOrders(BasicBlock* bb);
   void ComputeDomPostOrderTraversal(BasicBlock* bb);
-  void SetConstant(int32_t ssa_reg, int value);
-  void SetConstantWide(int ssa_reg, int64_t value);
   int GetSSAUseCount(int s_reg);
   bool BasicBlockOpt(BasicBlock* bb);
   bool BuildExtendedBBList(struct BasicBlock* bb);
@@ -1133,6 +1369,24 @@ class MIRGraph {
   void AnalyzeBlock(BasicBlock* bb, struct MethodStats* stats);
   bool ComputeSkipCompilation(struct MethodStats* stats, bool skip_default,
                               std::string* skip_message);
+
+  /**
+   * @brief Internal method used to expand the GC map to support additional slots.
+   * @param new_size_in_bytes The new size in bytes of the map per entry.
+   */
+  void ExpandGcMapEntries(size_t new_size_in_bytes);
+
+  /**
+   * @brief Used to expand the GC map entries to at least the size of verifier maps.
+   */
+  void ExpandGcMapEntriesToAtLeastVerifierSize();
+
+  /**
+   * @brief Used to obtain the GC map as generated per verifier.
+   * @param offset The offset whose map to obtain.
+   * @return Returns the GC map from verifier.
+   */
+  const uint8_t* GetVerifierGCMap(DexOffset offset);
 
   CompilationUnit* const cu_;
   GrowableArray<int>* ssa_base_vregs_;
@@ -1160,7 +1414,7 @@ class MIRGraph {
   // Stack of the loop head indexes and recalculation flags for RepeatingTopologicalSortIterator.
   GrowableArray<std::pair<uint16_t, bool>>* topological_order_loop_head_stack_;
   int* i_dom_list_;
-  ArenaBitVector** def_block_matrix_;    // num_dalvik_register x num_blocks.
+  ArenaBitVector** def_block_matrix_;    // original num registers x num_blocks.
   std::unique_ptr<ScopedArenaAllocator> temp_scoped_alloc_;
   uint16_t* temp_insn_data_;
   uint32_t temp_bit_vector_size_;
@@ -1175,6 +1429,7 @@ class MIRGraph {
   const DexFile::CodeItem* current_code_item_;
   GrowableArray<uint16_t> dex_pc_to_block_map_;  // FindBlock lookup cache.
   ArenaVector<DexCompilationUnit*> m_units_;     // List of methods included in this graph
+  DexOffset compiler_assigned_insn_size_;        // Used to keep track of size after compiler assigns a new non-overlapping offset.
   typedef std::pair<int, int> MIRLocation;       // Insert point, (m_unit_ index, offset)
   ArenaVector<MIRLocation> method_stack_;        // Include stack
   int current_method_;
@@ -1187,13 +1442,16 @@ class MIRGraph {
   unsigned int attributes_;
   Checkstats* checkstats_;
   ArenaAllocator* arena_;
+  static MIRGraphFctPtr plugin_create_mir_graph_;
   int backward_branches_;
   int forward_branches_;
-  GrowableArray<CompilerTemp*> compiler_temps_;
-  size_t num_non_special_compiler_temps_;
-  size_t max_available_non_special_compiler_temps_;
-  size_t max_available_special_compiler_temps_;
-  bool punt_to_interpreter_;                    // Difficult or not worthwhile - just interpret.
+  size_t num_non_special_compiler_temps_;  // Keeps track of allocated non-special compiler temps. These are VRs that are in compiler temp region on stack.
+  size_t max_available_non_special_compiler_temps_;  // Keeps track of maximum available non-special temps.
+  size_t max_available_special_compiler_temps_;      // Keeps track of maximum available special temps.
+  bool requested_backend_temp_;            // Keeps track whether BE temps have been requested.
+  size_t reserved_temps_for_backend_;      // Keeps track of the remaining temps that are reserved for BE.
+  bool compiler_temps_committed_;          // Keeps track whether number of temps has been frozen (for example post frame size calculation).
+  bool punt_to_interpreter_;               // Difficult or not worthwhile - just interpret.
   uint64_t merged_df_flags_;
   GrowableArray<MirIFieldLoweringInfo> ifield_lowering_infos_;
   GrowableArray<MirSFieldLoweringInfo> sfield_lowering_infos_;
@@ -1201,10 +1459,44 @@ class MIRGraph {
   static const uint64_t oat_data_flow_attributes_[kMirOpLast];
   GrowableArray<BasicBlock*> gen_suspend_test_list_;  // List of blocks containing suspend tests
 
+  /**
+   * @brief Used to keep track whether GC maps need recalculated.
+   */
+  bool recalculate_gc_maps_;
+
+  /**
+   * @brief Holds offset to GC map.
+   */
+  ArenaSafeMap<DexOffset, ArenaBitVector*> offset_to_gc_map_;
+
+  /**
+   * @brief Keeps track of how many bytes each GC map is.
+   */
+  size_t gc_map_entry_size_;
+
+  /**
+   * @brief Used to provide verifier GC map whose size matches gc_map_entry_size_.
+   * @details New calls to GetGCMap will clobber this so it should be used before
+   * another call.
+   */
+  ArenaBitVector* gc_map_cache_;
+
+  /**
+   * @brief Used to record shorty for invoke targets in unit tests.
+   */
+  const char** shorty_for_test_;
+
+  friend class MirOptimizationTest;
   friend class ClassInitCheckEliminationTest;
   friend class GlobalValueNumberingTest;
   friend class LocalValueNumberingTest;
+
+  // Method inliners must be able to update the MIRGraph so they can add blocks, add try/catch
+  // information, update dex units, and add lowering information.
+  friend class MethodInliner;
+  friend class ControlFlowGraph;
   friend class TopologicalSortOrderTest;
+  friend class ReferenceMapCalculatorTest;
 };
 
 }  // namespace art

@@ -490,6 +490,12 @@ Thread* ThreadList::SuspendThreadByPeer(jobject peer, bool request_suspension,
       {
         MutexLock mu(self, *Locks::thread_suspend_count_lock_);
         if (request_suspension) {
+          if (self->GetSuspendCount() > 0) {
+            // We hold the suspend count lock but another thread is trying to suspend us. Its not
+            // safe to try to suspend another thread in case we get a cycle. Start the loop again
+            // which will allow this thread to be suspended.
+            continue;
+          }
           thread->ModifySuspendCount(self, +1, debug_suspension);
           request_suspension = false;
           did_suspend_request = true;
@@ -567,6 +573,12 @@ Thread* ThreadList::SuspendThreadByThreadId(uint32_t thread_id, bool debug_suspe
       {
         MutexLock mu(self, *Locks::thread_suspend_count_lock_);
         if (suspended_thread == nullptr) {
+          if (self->GetSuspendCount() > 0) {
+            // We hold the suspend count lock but another thread is trying to suspend us. Its not
+            // safe to try to suspend another thread in case we get a cycle. Start the loop again
+            // which will allow this thread to be suspended.
+            continue;
+          }
           thread->ModifySuspendCount(self, +1, debug_suspension);
           suspended_thread = thread;
         } else {

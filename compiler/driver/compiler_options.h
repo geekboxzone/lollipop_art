@@ -28,13 +28,16 @@ class CompilerOptions {
     kBalanced,            // Try to get the best performance return on compilation investment.
     kSpeed,               // Maximize runtime performance.
     kEverything,          // Force compilation (Note: excludes compilaton of class initializers).
+    kO1,                  // Vendor specific optimization level 1.
+    kO2,                  // Vendor specific optimization level 2.
+    kO3                   // Vendor specific optimization level 3.
   };
 
   // Guide heuristics to determine whether to compile method if profile data not available.
 #if ART_SMALL_MODE
   static const CompilerFilter kDefaultCompilerFilter = kInterpretOnly;
 #else
-  static const CompilerFilter kDefaultCompilerFilter = kSpeed;
+  static const CompilerFilter kDefaultCompilerFilter = kO2;
 #endif
   static const size_t kDefaultHugeMethodThreshold = 10000;
   static const size_t kDefaultLargeMethodThreshold = 600;

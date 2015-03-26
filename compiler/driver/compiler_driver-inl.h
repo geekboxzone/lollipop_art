@@ -20,6 +20,7 @@
 #include "compiler_driver.h"
 
 #include "dex/compiler_ir.h"
+#include "dex_compilation_unit.h"
 #include "field_helper.h"
 #include "mirror/art_field-inl.h"
 #include "mirror/art_method-inl.h"
@@ -211,7 +212,7 @@ inline int CompilerDriver::IsFastInvoke(
     Handle<mirror::ClassLoader> class_loader, const DexCompilationUnit* mUnit,
     mirror::Class* referrer_class, mirror::ArtMethod* resolved_method, InvokeType* invoke_type,
     MethodReference* target_method, const MethodReference* devirt_target,
-    uintptr_t* direct_code, uintptr_t* direct_method) {
+    uintptr_t* direct_code, uintptr_t* direct_method, uint32_t* code_item_offset) {
   // Don't try to fast-path if we don't understand the caller's class.
   if (UNLIKELY(referrer_class == nullptr)) {
     return 0;
@@ -251,6 +252,9 @@ inline int CompilerDriver::IsFastInvoke(
                                   target_method,
                                   /*out*/direct_code,
                                   /*out*/direct_method);
+    if (code_item_offset != nullptr) {
+      *code_item_offset = resolved_method->GetCodeItemOffset();
+    }
     DCHECK_NE(*invoke_type, kSuper) << PrettyMethod(resolved_method);
     if (*invoke_type == kDirect) {
       stats_flags |= kFlagsMethodResolvedVirtualMadeDirect;
@@ -287,6 +291,9 @@ inline int CompilerDriver::IsFastInvoke(
                                   target_method,
                                   /*out*/direct_code,
                                   /*out*/direct_method);
+    if (code_item_offset != nullptr) {
+      *code_item_offset = called_method->GetCodeItemOffset();
+    }
     DCHECK_NE(*invoke_type, kSuper);
     if (*invoke_type == kDirect) {
       stats_flags |= kFlagsMethodResolvedPreciseTypeDevirtualization;
@@ -309,6 +316,9 @@ inline int CompilerDriver::IsFastInvoke(
                                 target_method,
                                 /*out*/direct_code,
                                 /*out*/direct_method);
+  if (code_item_offset != nullptr) {
+    *code_item_offset = resolved_method->GetCodeItemOffset();
+  }
   return stats_flags;
 }
 

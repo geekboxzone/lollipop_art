@@ -34,6 +34,7 @@
 #include "compiler_driver-inl.h"
 #include "dex_compilation_unit.h"
 #include "dex_file-inl.h"
+#include "dex/selectivity.h"
 #include "dex/verification_results.h"
 #include "dex/verified_method.h"
 #include "dex/quick/dex_file_method_inliner.h"
@@ -365,9 +366,9 @@ CompilerDriver::CompilerDriver(const CompilerOptions* compiler_options,
       compiler_enable_auto_elf_loading_(nullptr),
       compiler_get_method_code_addr_(nullptr),
       support_boot_image_fixup_(instruction_set != kMips),
-      cfi_info_(nullptr),
       // Use actual deduping only if we don't use swap.
       dedupe_code_("dedupe code", *swap_space_allocator_),
+      dedupe_src_mapping_table_("dedupe source mapping table", *swap_space_allocator_),
       dedupe_mapping_table_("dedupe mapping table", *swap_space_allocator_),
       dedupe_vmap_table_("dedupe vmap table", *swap_space_allocator_),
       dedupe_gc_map_("dedupe gc map", *swap_space_allocator_),
@@ -389,11 +390,6 @@ CompilerDriver::CompilerDriver(const CompilerOptions* compiler_options,
     CHECK(image_classes_.get() == nullptr);
   }
 
-  // Are we generating CFI information?
-  if (compiler_options->GetGenerateGDBInformation()) {
-    cfi_info_.reset(compiler_->GetCallFrameInformationInitialization(*this));
-  }
-
   // Read the profile file if one is provided.
   if (!profile_file.empty()) {
     profile_present_ = profile_file_.LoadFile(profile_file);
@@ -407,6 +403,10 @@ CompilerDriver::CompilerDriver(const CompilerOptions* compiler_options,
 
 SwapVector<uint8_t>* CompilerDriver::DeduplicateCode(const ArrayRef<const uint8_t>& code) {
   return dedupe_code_.Add(Thread::Current(), code);
+}
+
+SwapSrcMap* CompilerDriver::DeduplicateSrcMappingTable(const ArrayRef<SrcMapElem>& src_map) {
+  return dedupe_src_mapping_table_.Add(Thread::Current(), src_map);
 }
 
 SwapVector<uint8_t>* CompilerDriver::DeduplicateMappingTable(const ArrayRef<const uint8_t>& code) {
@@ -447,7 +447,7 @@ CompilerTls* CompilerDriver::GetTls() {
   // Lazily create thread-local storage
   CompilerTls* res = static_cast<CompilerTls*>(pthread_getspecific(tls_key_));
   if (res == nullptr) {
-    res = new CompilerTls();
+    res = compiler_->CreateNewCompilerTls();
     CHECK_PTHREAD_CALL(pthread_setspecific, (tls_key_, res), "compiler tls");
   }
   return res;
@@ -513,6 +513,7 @@ void CompilerDriver::CompileAll(jobject class_loader,
   Compile(class_loader, dex_files, thread_pool.get(), timings);
   if (dump_stats_) {
     stats_->Dump();
+    Selectivity::DumpSelectivityStats();
   }
 }
 
@@ -624,6 +625,8 @@ void CompilerDriver::PreCompile(jobject class_loader, const std::vector<const De
 
   UpdateImageClasses(timings);
   VLOG(compiler) << "UpdateImageClasses: " << GetMemoryUsageString(false);
+
+  PreCompileSummary();
 }
 
 bool CompilerDriver::IsImageClass(const char* descriptor) const {
@@ -822,6 +825,10 @@ void CompilerDriver::UpdateImageClasses(TimingLogger* timings) {
     heap->VisitObjects(FindClinitImageClassesCallback, this);
     self->EndAssertNoThreadSuspension(old_cause);
   }
+}
+
+void CompilerDriver::PreCompileSummary() {
+  Selectivity::PreCompileSummaryLogic(this, verification_results_);
 }
 
 bool CompilerDriver::CanAssumeTypeIsPresentInDexCache(const DexFile& dex_file, uint32_t type_idx) {
@@ -1310,7 +1317,7 @@ bool CompilerDriver::ComputeInvokeInfo(const DexCompilationUnit* mUnit, const ui
 
       stats_flags = IsFastInvoke(
           soa, dex_cache, class_loader, mUnit, referrer_class, resolved_method,
-          invoke_type, target_method, devirt_target, direct_code, direct_method);
+          invoke_type, target_method, devirt_target, direct_code, direct_method, nullptr);
       result = stats_flags != 0;
     } else {
       // Devirtualization not enabled. Inline IsFastInvoke(), dropping the devirtualization parts.
@@ -1547,6 +1554,20 @@ class ParallelCompilationManager {
   DISALLOW_COPY_AND_ASSIGN(ParallelCompilationManager);
 };
 
+// Return true if the method should be skipped during compilation.
+//
+// The logic that determines if we should skip is a function pointer set
+// within the Selectivity class. We can set this logic by calling
+// Selectivity::SetSkipMethodCompile.
+// If function pointer not set, will return false.
+static bool SkipMethodCompile(const DexFile::CodeItem* code_item, uint32_t method_idx,
+                              uint32_t* access_flags, uint16_t* class_def_idx,
+                              const DexFile& dex_file,
+                              DexToDexCompilationLevel* dex_to_dex_compilation_level) {
+  return Selectivity::SkipMethodCompile(code_item, method_idx, access_flags,
+                                        class_def_idx, dex_file, dex_to_dex_compilation_level);
+}
+
 // A fast version of SkipClass above if the class pointer is available
 // that avoids the expensive FindInClassPath search.
 static bool SkipClass(jobject class_loader, const DexFile& dex_file, mirror::Class* klass)
@@ -1589,6 +1610,28 @@ static void CheckAndClearResolveException(Thread* self)
     LOG(FATAL) << "Unexpected exception " << exception->Dump();
   }
   self->ClearException();
+}
+
+// Return true if the class should be skipped during compilation.
+//
+// The logic that determines if we should skip is a function pointer set
+// within the Selectivity class. We can set this logic by calling
+// Selectivity::SetSkipClassCompile.
+// If function pointer not set, will return false.
+//
+// This version differs from the others by the two other SkipClass functions by enabling
+// this class selectivity ONLY in the compile phase whereas the others are also used in the
+// Resolve and Verify stages.
+static bool SkipClassCompilation(jobject class_loader, const DexFile& dex_file,
+                                 mirror::Class* klass,
+                                 const DexFile::ClassDef& class_def)
+                                 SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  if (Selectivity::SkipClassCompile(dex_file, class_def)) {
+    return true;
+  } else {
+    // If we set no selectivity logic or it returned false, use default SkipClass logic.
+    return SkipClass(class_loader, dex_file, klass);
+  }
 }
 
 static void ResolveClassFieldsAndMethods(const ParallelCompilationManager* manager,
@@ -1678,6 +1721,7 @@ static void ResolveClassFieldsAndMethods(const ParallelCompilationManager* manag
         if (method == nullptr) {
           CheckAndClearResolveException(soa.Self());
         }
+        Selectivity::AnalyzeResolvedMethod(method, dex_file);
         it.Next();
       }
       while (it.HasNextVirtualMethod()) {
@@ -1688,6 +1732,7 @@ static void ResolveClassFieldsAndMethods(const ParallelCompilationManager* manag
         if (method == nullptr) {
           CheckAndClearResolveException(soa.Self());
         }
+        Selectivity::AnalyzeResolvedMethod(method, dex_file);
         it.Next();
       }
       DCHECK(!it.HasNext());
@@ -2006,7 +2051,7 @@ void CompilerDriver::CompileClass(const ParallelCompilationManager* manager, siz
     if (klass.Get() == nullptr) {
       CHECK(soa.Self()->IsExceptionPending());
       soa.Self()->ClearException();
-    } else if (SkipClass(jclass_loader, dex_file, klass.Get())) {
+    } else if (SkipClassCompilation(jclass_loader, dex_file, klass.Get(), class_def)) {
       return;
     }
   }
@@ -2117,6 +2162,11 @@ void CompilerDriver::CompileMethod(const DexFile::CodeItem* code_item, uint32_t 
                    verification_results_->IsCandidateForCompilation(method_ref, access_flags) &&
                    // Did not fail to create VerifiedMethod metadata.
                    has_verified_method;
+    if (SkipMethodCompile(code_item, method_idx, &access_flags, &class_def_idx, dex_file,
+                          &dex_to_dex_compilation_level)) {
+      compile = false;
+      dex_to_dex_compilation_level = kDontDexToDexCompile;
+    }
     if (compile) {
       // NOTE: if compiler declines to compile this method, it will return nullptr.
       compiled_method = compiler_->Compile(code_item, access_flags, invoke_type, class_def_idx,
@@ -2316,6 +2366,7 @@ std::string CompilerDriver::GetMemoryUsageString(bool extended) const {
   }
   if (extended) {
     oss << "\nCode dedupe: " << dedupe_code_.DumpStats();
+    oss << "\nSource mapping table dedupe: " << dedupe_src_mapping_table_.DumpStats();
     oss << "\nMapping table dedupe: " << dedupe_mapping_table_.DumpStats();
     oss << "\nVmap table dedupe: " << dedupe_vmap_table_.DumpStats();
     oss << "\nGC map dedupe: " << dedupe_gc_map_.DumpStats();

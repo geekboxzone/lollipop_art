@@ -830,17 +830,74 @@ const uint32_t MIRGraph::analysis_attributes_[kMirOpLast] = {
   // 109 MIR_RANGE_CHECK
   AN_NONE,
 
-  // 110 MIR_DIV_ZERO_CHECK
+  // 10A MIR_DIV_ZERO_CHECK
   AN_NONE,
 
-  // 111 MIR_CHECK
+  // 10B MIR_CHECK
   AN_NONE,
 
-  // 112 MIR_CHECKPART2
+  // 10C MIR_CHECKPART2
   AN_NONE,
 
-  // 113 MIR_SELECT
+  // 10D MIR_SELECT
   AN_NONE,
+
+  // 114 MirOpConstVector
+  AN_NONE,
+
+  // 115 MirOpMoveVector
+  AN_NONE,
+
+  // 116 MirOpPackedMultiply
+  AN_NONE,
+
+  // 117 MirOpPackedAddition
+  AN_NONE,
+
+  // 118 MirOpPackedSubtract
+  AN_NONE,
+
+  // 119 MirOpPackedShiftLeft
+  AN_NONE,
+
+  // 120 MirOpPackedSignedShiftRight
+  AN_NONE,
+
+  // 121 MirOpPackedUnsignedShiftRight
+  AN_NONE,
+
+  // 122 MirOpPackedAnd
+  AN_NONE,
+
+  // 123 MirOpPackedOr
+  AN_NONE,
+
+  // 124 MirOpPackedXor
+  AN_NONE,
+
+  // 125 MirOpPackedAddReduce
+  AN_NONE,
+
+  // 126 MirOpPackedReduce
+  AN_NONE,
+
+  // 127 MirOpPackedSet
+  AN_NONE,
+
+  // 128 MirOpReserveVectorRegisters
+  AN_NONE,
+
+  // 129 MirOpReturnVectorRegisters
+  AN_NONE,
+
+  // 11E MirOpMemBarrier
+  AN_NONE,
+
+  // 11F MirOpPackedArrayGet
+  AN_ARRAYOP,
+
+  // 120 MirOpPackedArrayPut
+  AN_ARRAYOP,
 };
 
 struct MethodStats {
@@ -1036,6 +1093,9 @@ bool MIRGraph::SkipCompilation(std::string* skip_message) {
       small_cutoff = compiler_options.GetTinyMethodThreshold();
       default_cutoff = compiler_options.GetSmallMethodThreshold();
       break;
+    case CompilerOptions::kO1:
+    case CompilerOptions::kO2:
+    case CompilerOptions::kO3:
     case CompilerOptions::kSpeed:
       small_cutoff = compiler_options.GetHugeMethodThreshold();
       default_cutoff = compiler_options.GetHugeMethodThreshold();
@@ -1108,7 +1168,7 @@ bool MIRGraph::SkipCompilation(std::string* skip_message) {
 
 void MIRGraph::DoCacheFieldLoweringInfo() {
   // All IGET/IPUT/SGET/SPUT instructions take 2 code units and there must also be a RETURN.
-  const uint32_t max_refs = (current_code_item_->insns_size_in_code_units_ - 1u) / 2u;
+  const uint32_t max_refs = (GetNumDalvikInsns() - 1u) / 2u;
   ScopedArenaAllocator allocator(&cu_->arena_stack);
   uint16_t* field_idxs =
       reinterpret_cast<uint16_t*>(allocator.Alloc(max_refs * sizeof(uint16_t), kArenaAllocMisc));
@@ -1124,12 +1184,11 @@ void MIRGraph::DoCacheFieldLoweringInfo() {
     for (MIR* mir = bb->first_mir_insn; mir != nullptr; mir = mir->next) {
       if (mir->dalvikInsn.opcode >= Instruction::IGET &&
           mir->dalvikInsn.opcode <= Instruction::SPUT_SHORT) {
-        const Instruction* insn = Instruction::At(current_code_item_->insns_ + mir->offset);
         // Get field index and try to find it among existing indexes. If found, it's usually among
         // the last few added, so we'll start the search from ifield_pos/sfield_pos. Though this
         // is a linear search, it actually performs much better than map based approach.
         if (mir->dalvikInsn.opcode <= Instruction::IPUT_SHORT) {
-          uint16_t field_idx = insn->VRegC_22c();
+          uint16_t field_idx = mir->dalvikInsn.vC;
           size_t i = ifield_pos;
           while (i != 0u && field_idxs[i - 1] != field_idx) {
             --i;
@@ -1141,7 +1200,7 @@ void MIRGraph::DoCacheFieldLoweringInfo() {
             field_idxs[ifield_pos++] = field_idx;
           }
         } else {
-          uint16_t field_idx = insn->VRegB_21c();
+          uint16_t field_idx = mir->dalvikInsn.vB;
           size_t i = sfield_pos;
           while (i != max_refs && field_idxs[i] != field_idx) {
             ++i;
@@ -1221,7 +1280,7 @@ void MIRGraph::DoCacheMethodLoweringInfo() {
   ScopedArenaAllocator allocator(&cu_->arena_stack);
 
   // All INVOKE instructions take 3 code units and there must also be a RETURN.
-  uint32_t max_refs = (current_code_item_->insns_size_in_code_units_ - 1u) / 3u;
+  uint32_t max_refs = (GetNumDalvikInsns() - 1u) / 3u;
 
   // Map invoke key (see MapEntry) to lowering info index and vice versa.
   // The invoke_map and sequential entries are essentially equivalent to Boost.MultiIndex's
@@ -1242,14 +1301,13 @@ void MIRGraph::DoCacheMethodLoweringInfo() {
           mir->dalvikInsn.opcode <= Instruction::INVOKE_INTERFACE_RANGE &&
           mir->dalvikInsn.opcode != Instruction::RETURN_VOID_BARRIER) {
         // Decode target method index and invoke type.
-        const Instruction* insn = Instruction::At(current_code_item_->insns_ + mir->offset);
         uint16_t target_method_idx;
         uint16_t invoke_type_idx;
         if (mir->dalvikInsn.opcode <= Instruction::INVOKE_INTERFACE) {
-          target_method_idx = insn->VRegB_35c();
+          target_method_idx = mir->dalvikInsn.vB;
           invoke_type_idx = mir->dalvikInsn.opcode - Instruction::INVOKE_VIRTUAL;
         } else {
-          target_method_idx = insn->VRegB_3rc();
+          target_method_idx = mir->dalvikInsn.vB;
           invoke_type_idx = mir->dalvikInsn.opcode - Instruction::INVOKE_VIRTUAL_RANGE;
         }
 

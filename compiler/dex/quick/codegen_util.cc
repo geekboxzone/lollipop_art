@@ -15,6 +15,7 @@
  */
 
 #include "dex/compiler_internals.h"
+#include "driver/compiler_options.h"
 #include "dex_file-inl.h"
 #include "gc_map.h"
 #include "gc_map_builder.h"
@@ -274,8 +275,8 @@ void Mir2Lir::DumpLIRInsn(LIR* lir, unsigned char* base_addr) {
 }
 
 void Mir2Lir::DumpPromotionMap() {
-  int num_regs = cu_->num_dalvik_registers + mir_graph_->GetNumUsedCompilerTemps();
-  for (int i = 0; i < num_regs; i++) {
+  uint32_t num_regs = mir_graph_->GetNumOfCodeAndTempVRs();
+  for (uint32_t i = 0; i < num_regs; i++) {
     PromotionMap v_reg_map = promotion_map_[i];
     std::string buf;
     if (v_reg_map.fp_location == kLocPhysReg) {
@@ -283,12 +284,13 @@ void Mir2Lir::DumpPromotionMap() {
     }
 
     std::string buf3;
-    if (i < cu_->num_dalvik_registers) {
+    if (i < mir_graph_->GetNumOfCodeVRs()) {
       StringAppendF(&buf3, "%02d", i);
-    } else if (i == mir_graph_->GetMethodSReg()) {
+    } else if (i == mir_graph_->GetNumOfCodeVRs()) {
       buf3 = "Method*";
     } else {
-      StringAppendF(&buf3, "ct%d", i - cu_->num_dalvik_registers);
+      uint32_t diff = i - mir_graph_->GetNumOfCodeVRs();
+      StringAppendF(&buf3, "ct%d", diff);
     }
 
     LOG(INFO) << StringPrintf("V[%s] -> %s%d%s", buf3.c_str(),
@@ -317,11 +319,11 @@ void Mir2Lir::CodegenDump() {
   LOG(INFO) << "Dumping LIR insns for "
             << PrettyMethod(cu_->method_idx, *cu_->dex_file);
   LIR* lir_insn;
-  int insns_size = cu_->code_item->insns_size_in_code_units_;
+  int insns_size = mir_graph_->GetNumDalvikInsns();
 
-  LOG(INFO) << "Regs (excluding ins) : " << cu_->num_regs;
-  LOG(INFO) << "Ins          : " << cu_->num_ins;
-  LOG(INFO) << "Outs         : " << cu_->num_outs;
+  LOG(INFO) << "Regs (excluding ins) : " << mir_graph_->GetNumOfLocalCodeVRs();
+  LOG(INFO) << "Ins          : " << mir_graph_->GetNumOfInVRs();
+  LOG(INFO) << "Outs         : " << mir_graph_->GetNumOfOutVRs();
   LOG(INFO) << "CoreSpills       : " << num_core_spills_;
   LOG(INFO) << "FPSpills       : " << num_fp_spills_;
   LOG(INFO) << "CompilerTemps    : " << mir_graph_->GetNumUsedCompilerTemps();
@@ -654,15 +656,19 @@ bool Mir2Lir::VerifyCatchEntries() {
 
 
 void Mir2Lir::CreateMappingTables() {
+  bool generate_src_map = cu_->compiler_driver->GetCompilerOptions().GetIncludeDebugSymbols();
+
   uint32_t pc2dex_data_size = 0u;
   uint32_t pc2dex_entries = 0u;
   uint32_t pc2dex_offset = 0u;
   uint32_t pc2dex_dalvik_offset = 0u;
+  uint32_t pc2dex_src_entries = 0u;
   uint32_t dex2pc_data_size = 0u;
   uint32_t dex2pc_entries = 0u;
   uint32_t dex2pc_offset = 0u;
   uint32_t dex2pc_dalvik_offset = 0u;
   for (LIR* tgt_lir = first_lir_insn_; tgt_lir != NULL; tgt_lir = NEXT_LIR(tgt_lir)) {
+    pc2dex_src_entries++;
     if (!tgt_lir->flags.is_nop && (tgt_lir->opcode == kPseudoSafepointPC)) {
       pc2dex_entries += 1;
       DCHECK(pc2dex_offset <= tgt_lir->offset);
@@ -683,6 +689,10 @@ void Mir2Lir::CreateMappingTables() {
     }
   }
 
+  if (generate_src_map) {
+    src_mapping_table_.reserve(pc2dex_src_entries);
+  }
+
   uint32_t total_entries = pc2dex_entries + dex2pc_entries;
   uint32_t hdr_data_size = UnsignedLeb128Size(total_entries) + UnsignedLeb128Size(pc2dex_entries);
   uint32_t data_size = hdr_data_size + pc2dex_data_size + dex2pc_data_size;
@@ -698,6 +708,10 @@ void Mir2Lir::CreateMappingTables() {
   dex2pc_offset = 0u;
   dex2pc_dalvik_offset = 0u;
   for (LIR* tgt_lir = first_lir_insn_; tgt_lir != NULL; tgt_lir = NEXT_LIR(tgt_lir)) {
+    if (generate_src_map && !tgt_lir->flags.is_nop) {
+      src_mapping_table_.push_back(SrcMapElem({tgt_lir->offset,
+              static_cast<int32_t>(tgt_lir->dalvik_offset)}));
+    }
     if (!tgt_lir->flags.is_nop && (tgt_lir->opcode == kPseudoSafepointPC)) {
       DCHECK(pc2dex_offset <= tgt_lir->offset);
       write_pos = EncodeUnsignedLeb128(write_pos, tgt_lir->offset - pc2dex_offset);
@@ -756,20 +770,17 @@ void Mir2Lir::CreateNativeGcMap() {
     }
   }
   MethodReference method_ref(cu_->dex_file, cu_->method_idx);
-  const std::vector<uint8_t>& gc_map_raw =
-      mir_graph_->GetCurrentDexCompilationUnit()->GetVerifiedMethod()->GetDexGcMap();
-  verifier::DexPcToReferenceMap dex_gc_map(&(gc_map_raw)[0]);
-  DCHECK_EQ(gc_map_raw.size(), dex_gc_map.RawSize());
+
   // Compute native offset to references size.
   GcMapBuilder native_gc_map_builder(&native_gc_map_,
                                      mapping_table.PcToDexSize(),
-                                     max_native_offset, dex_gc_map.RegWidth());
+                                     max_native_offset, mir_graph_->GetGCMapEntrySize());
 
   for (auto it = mapping_table.PcToDexBegin(), end = mapping_table.PcToDexEnd(); it != end; ++it) {
     uint32_t native_offset = it.NativePcOffset();
     uint32_t dex_pc = it.DexPc();
-    const uint8_t* references = dex_gc_map.FindBitMap(dex_pc, false);
-    CHECK(references != NULL) << "Missing ref for dex pc 0x" << std::hex << dex_pc <<
+    const uint8_t* references = mir_graph_->GetGCMap(dex_pc, true);
+    CHECK(references != nullptr) << "Missing ref for dex pc 0x" << std::hex << dex_pc <<
         ": " << PrettyMethod(cu_->method_idx, *cu_->dex_file);
     native_gc_map_builder.AddEntry(native_offset, references);
   }
@@ -1097,7 +1108,7 @@ CompiledMethod* Mir2Lir::GetCompiledMethod() {
     vmap_encoder.PushBackUnsigned(0u);  // Size is 0.
   }
 
-  std::unique_ptr<std::vector<uint8_t>> cfi_info(ReturnCallFrameInformation());
+  std::unique_ptr<std::vector<uint8_t>> cfi_info(ReturnFrameDescriptionEntry());
   ArrayRef<const uint8_t> cfi_ref;
   if (cfi_info.get() != nullptr) {
     cfi_ref = ArrayRef<const uint8_t>(*cfi_info);
@@ -1106,6 +1117,7 @@ CompiledMethod* Mir2Lir::GetCompiledMethod() {
       cu_->compiler_driver, cu_->instruction_set,
       ArrayRef<const uint8_t>(code_buffer_),
       frame_size_, core_spill_mask_, fp_spill_mask_,
+      &src_mapping_table_,
       ArrayRef<const uint8_t>(encoded_mapping_table_),
       ArrayRef<const uint8_t>(vmap_encoder.GetData()),
       ArrayRef<const uint8_t>(native_gc_map_),
@@ -1123,7 +1135,8 @@ size_t Mir2Lir::GetNumBytesForCompilerTempSpillRegion() {
   // By default assume that the Mir2Lir will need one slot for each temporary.
   // If the backend can better determine temps that have non-overlapping ranges and
   // temps that do not need spilled, it can actually provide a small region.
-  return (mir_graph_->GetNumUsedCompilerTemps() * sizeof(uint32_t));
+  mir_graph_->CommitCompilerTemps();
+  return mir_graph_->GetNumBytesForSpecialTemps() + mir_graph_->GetMaximumBytesForNonSpecialTemps();
 }
 
 int Mir2Lir::ComputeFrameSize() {
@@ -1131,7 +1144,8 @@ int Mir2Lir::ComputeFrameSize() {
   uint32_t size = num_core_spills_ * GetBytesPerGprSpillLocation(cu_->instruction_set)
                   + num_fp_spills_ * GetBytesPerFprSpillLocation(cu_->instruction_set)
                   + sizeof(uint32_t)  // Filler.
-                  + (cu_->num_regs + cu_->num_outs) * sizeof(uint32_t)
+                  + mir_graph_->GetNumOfLocalCodeVRs()  * sizeof(uint32_t)
+                  + mir_graph_->GetNumOfOutVRs() * sizeof(uint32_t)
                   + GetNumBytesForCompilerTempSpillRegion();
   /* Align and set */
   return RoundUp(size, kStackAlignment);
@@ -1201,10 +1215,16 @@ int32_t Mir2Lir::LowestSetBit(uint64_t x) {
   return bit_posn;
 }
 
-bool Mir2Lir::BadOverlap(RegLocation rl_src, RegLocation rl_dest) {
+bool Mir2Lir::PartiallyIntersects(RegLocation rl_src, RegLocation rl_dest) {
   DCHECK(rl_src.wide);
   DCHECK(rl_dest.wide);
   return (abs(mir_graph_->SRegToVReg(rl_src.s_reg_low) - mir_graph_->SRegToVReg(rl_dest.s_reg_low)) == 1);
+}
+
+bool Mir2Lir::Intersects(RegLocation rl_src, RegLocation rl_dest) {
+  DCHECK(rl_src.wide);
+  DCHECK(rl_dest.wide);
+  return (abs(mir_graph_->SRegToVReg(rl_src.s_reg_low) - mir_graph_->SRegToVReg(rl_dest.s_reg_low)) <= 1);
 }
 
 LIR *Mir2Lir::OpCmpMemImmBranch(ConditionCode cond, RegStorage temp_reg, RegStorage base_reg,
@@ -1278,7 +1298,7 @@ void Mir2Lir::LoadString(uint32_t string_idx, RegStorage target_reg) {
   AppendLIR(load_pc_rel);
 }
 
-std::vector<uint8_t>* Mir2Lir::ReturnCallFrameInformation() {
+std::vector<uint8_t>* Mir2Lir::ReturnFrameDescriptionEntry() {
   // Default case is to do nothing.
   return nullptr;
 }

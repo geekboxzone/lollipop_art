@@ -32,6 +32,11 @@ static size_t constexpr kUninitializedFrameSize = 0;
 
 class CodeGenerator;
 class DexCompilationUnit;
+class SrcMapElem;
+
+template <class Alloc>
+class SrcMap;
+using DefaultSrcMap = SrcMap<std::allocator<SrcMapElem>>;
 
 class CodeAllocator {
  public:
@@ -126,7 +131,7 @@ class CodeGenerator : public ArenaObject {
 
   void GenerateSlowPaths();
 
-  void BuildMappingTable(std::vector<uint8_t>* vector) const;
+  void BuildMappingTable(std::vector<uint8_t>* vector, DefaultSrcMap* src_map) const;
   void BuildVMapTable(std::vector<uint8_t>* vector) const;
   void BuildNativeGCMap(
       std::vector<uint8_t>* vector, const DexCompilationUnit& dex_compilation_unit) const;
@@ -142,6 +147,7 @@ class CodeGenerator : public ArenaObject {
  protected:
   CodeGenerator(HGraph* graph, size_t number_of_registers)
       : frame_size_(kUninitializedFrameSize),
+        core_spill_mask_(-1),
         graph_(graph),
         block_labels_(graph->GetArena(), 0),
         pc_infos_(graph->GetArena(), 32),

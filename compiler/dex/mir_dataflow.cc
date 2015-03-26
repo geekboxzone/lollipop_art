@@ -824,70 +824,79 @@ const uint64_t MIRGraph::oat_data_flow_attributes_[kMirOpLast] = {
   DF_NOP,
 
   // 108 MIR_NULL_CHECK
-  0,
+  DF_UA | DF_REF_A | DF_NULL_CHK_0 | DF_LVN,
 
   // 109 MIR_RANGE_CHECK
   0,
 
-  // 110 MIR_DIV_ZERO_CHECK
+  // 10A MIR_DIV_ZERO_CHECK
   0,
 
-  // 111 MIR_CHECK
+  // 10B MIR_CHECK
   0,
 
-  // 112 MIR_CHECKPART2
+  // 10C MIR_CHECKPART2
   0,
 
-  // 113 MIR_SELECT
-  DF_DA | DF_UB,
+  // 10D MIR_SELECT
+  DF_FORMAT_EXTENDED,
 
-  // 114 MirOpConstVector
-  DF_DA,
-
-  // 115 MirOpMoveVector
+  // 10E MirOpConstVector
   0,
 
-  // 116 MirOpPackedMultiply
+  // 10F MirOpMoveVector
   0,
 
-  // 117 MirOpPackedAddition
+  // 110 MirOpPackedMultiply
   0,
 
-  // 118 MirOpPackedSubtract
+  // 111 MirOpPackedAddition
   0,
 
-  // 119 MirOpPackedShiftLeft
+  // 112 MirOpPackedSubtract
   0,
 
-  // 120 MirOpPackedSignedShiftRight
+  // 113 MirOpPackedShiftLeft
   0,
 
-  // 121 MirOpPackedUnsignedShiftRight
+  // 114 MirOpPackedSignedShiftRight
   0,
 
-  // 122 MirOpPackedAnd
+  // 115 MirOpPackedUnsignedShiftRight
   0,
 
-  // 123 MirOpPackedOr
+  // 116 MirOpPackedAnd
   0,
 
-  // 124 MirOpPackedXor
+  // 117 MirOpPackedOr
   0,
 
-  // 125 MirOpPackedAddReduce
-  DF_DA | DF_UA,
-
-  // 126 MirOpPackedReduce
-  DF_DA,
-
-  // 127 MirOpPackedSet
-  DF_UB,
-
-  // 128 MirOpReserveVectorRegisters
+  // 118 MirOpPackedXor
   0,
 
-  // 129 MirOpReturnVectorRegisters
+  // 119 MirOpPackedAddReduce
+  DF_FORMAT_EXTENDED,
+
+  // 11A MirOpPackedReduce
+  DF_FORMAT_EXTENDED,
+
+  // 11B MirOpPackedSet
+  DF_FORMAT_EXTENDED,
+
+  // 11C MirOpReserveVectorRegisters
   0,
+
+  // 11D MirOpReturnVectorRegisters
+  0,
+
+  // 11E MirOpMemBarrier
+  0,
+
+  // 11F MirOpPackedArrayGet
+  DF_UB | DF_UC | DF_NULL_CHK_0 | DF_RANGE_CHK_1 | DF_REF_B | DF_CORE_C | DF_LVN,
+
+  // 120 MirOpPackedArrayPut
+  DF_UB | DF_UC | DF_NULL_CHK_0 | DF_RANGE_CHK_1 | DF_REF_B | DF_CORE_C | DF_LVN,
 };
 
 /* Return the base virtual register for a SSA name */
@@ -912,7 +921,44 @@ void MIRGraph::HandleDef(ArenaBitVector* def_v, int dalvik_reg_id) {
 void MIRGraph::HandleExtended(ArenaBitVector* use_v, ArenaBitVector* def_v,
                             ArenaBitVector* live_in_v,
                             const MIR::DecodedInstruction& d_insn) {
+  // For vector MIRs, vC contains type information
+  bool is_vector_type_wide = false;
+  int type_size = d_insn.vC >> 16;
+  if (type_size == k64 || type_size == kDouble) {
+    is_vector_type_wide = true;
+  }
+
   switch (static_cast<int>(d_insn.opcode)) {
+    case kMirOpPackedAddReduce:
+      HandleLiveInUse(use_v, def_v, live_in_v, d_insn.vA);
+      if (is_vector_type_wide == true) {
+        HandleLiveInUse(use_v, def_v, live_in_v, d_insn.vA + 1);
+      }
+      HandleDef(def_v, d_insn.vA);
+      if (is_vector_type_wide == true) {
+        HandleDef(def_v, d_insn.vA + 1);
+      }
+      break;
+    case kMirOpPackedReduce:
+      HandleDef(def_v, d_insn.vA);
+      if (is_vector_type_wide == true) {
+        HandleDef(def_v, d_insn.vA + 1);
+      }
+      break;
+    case kMirOpPackedSet:
+      HandleLiveInUse(use_v, def_v, live_in_v, d_insn.vB);
+      if (is_vector_type_wide == true) {
+        HandleLiveInUse(use_v, def_v, live_in_v, d_insn.vB + 1);
+      }
+      break;
+    case kMirOpSelect:
+      HandleDef(def_v, d_insn.vA);
+      HandleLiveInUse(use_v, def_v, live_in_v, d_insn.arg[0]);
+      if (d_insn.arg[1] != 1) {
+        HandleLiveInUse(use_v, def_v, live_in_v, d_insn.vB);
+        HandleLiveInUse(use_v, def_v, live_in_v, d_insn.vC);
+      }
+      break;
     default:
       LOG(ERROR) << "Unexpected Extended Opcode " << d_insn.opcode;
       break;
@@ -930,11 +976,11 @@ bool MIRGraph::FindLocalLiveIn(BasicBlock* bb) {
   if (bb->data_flow_info == NULL) return false;
 
   use_v = bb->data_flow_info->use_v =
-      new (arena_) ArenaBitVector(arena_, cu_->num_dalvik_registers, false, kBitMapUse);
+      new (arena_) ArenaBitVector(arena_, GetNumOfCodeAndTempVRs(), false, kBitMapUse);
   def_v = bb->data_flow_info->def_v =
-      new (arena_) ArenaBitVector(arena_, cu_->num_dalvik_registers, false, kBitMapDef);
+      new (arena_) ArenaBitVector(arena_, GetNumOfCodeAndTempVRs(), false, kBitMapDef);
   live_in_v = bb->data_flow_info->live_in_v =
-      new (arena_) ArenaBitVector(arena_, cu_->num_dalvik_registers, false, kBitMapLiveIn);
+      new (arena_) ArenaBitVector(arena_, GetNumOfCodeAndTempVRs(), false, kBitMapLiveIn);
 
   for (mir = bb->first_mir_insn; mir != NULL; mir = mir->next) {
     uint64_t df_attributes = GetDataFlowAttributes(mir);
@@ -984,8 +1030,7 @@ bool MIRGraph::FindLocalLiveIn(BasicBlock* bb) {
 }
 
 int MIRGraph::AddNewSReg(int v_reg) {
-  // Compiler temps always have a subscript of 0
-  int subscript = (v_reg < 0) ? 0 : ++ssa_last_defs_[v_reg];
+  int subscript = ++ssa_last_defs_[v_reg];
   uint32_t ssa_reg = GetNumSSARegs();
   SetNumSSARegs(ssa_reg + 1);
   ssa_base_vregs_->Insert(v_reg);
@@ -1002,13 +1047,13 @@ int MIRGraph::AddNewSReg(int v_reg) {
 
 /* Find out the latest SSA register for a given Dalvik register */
 void MIRGraph::HandleSSAUse(int* uses, int dalvik_reg, int reg_index) {
-  DCHECK((dalvik_reg >= 0) && (dalvik_reg < cu_->num_dalvik_registers));
+  DCHECK((dalvik_reg >= 0) && (dalvik_reg < static_cast<int>(GetNumOfCodeAndTempVRs())));
   uses[reg_index] = vreg_to_ssa_map_[dalvik_reg];
 }
 
 /* Setup a new SSA register for a given Dalvik register */
 void MIRGraph::HandleSSADef(int* defs, int dalvik_reg, int reg_index) {
-  DCHECK((dalvik_reg >= 0) && (dalvik_reg < cu_->num_dalvik_registers));
+  DCHECK((dalvik_reg >= 0) && (dalvik_reg < static_cast<int>(GetNumOfCodeAndTempVRs())));
   int ssa_reg = AddNewSReg(dalvik_reg);
   vreg_to_ssa_map_[dalvik_reg] = ssa_reg;
   defs[reg_index] = ssa_reg;
@@ -1062,7 +1107,59 @@ void MIRGraph::DataFlowSSAFormat3RC(MIR* mir) {
 }
 
 void MIRGraph::DataFlowSSAFormatExtended(MIR* mir) {
+  const MIR::DecodedInstruction& d_insn = mir->dalvikInsn;
+  // For vector MIRs, vC contains type information
+  bool is_vector_type_wide = false;
+  int type_size = d_insn.vC >> 16;
+  if (type_size == k64 || type_size == kDouble) {
+    is_vector_type_wide = true;
+  }
+
   switch (static_cast<int>(mir->dalvikInsn.opcode)) {
+    case kMirOpPackedAddReduce:
+      // We have one use, plus one more for wide
+      AllocateSSAUseData(mir, is_vector_type_wide ? 2 : 1);
+      HandleSSAUse(mir->ssa_rep->uses, d_insn.vA, 0);
+      if (is_vector_type_wide == true) {
+        HandleSSAUse(mir->ssa_rep->uses, d_insn.vA + 1, 1);
+      }
+
+      // We have a def, plus one more for wide
+      AllocateSSADefData(mir, is_vector_type_wide ? 2 : 1);
+      HandleSSADef(mir->ssa_rep->defs, d_insn.vA, 0);
+      if (is_vector_type_wide == true) {
+        HandleSSADef(mir->ssa_rep->defs, d_insn.vA + 1, 1);
+      }
+      break;
+    case kMirOpPackedReduce:
+      // We have a def, plus one more for wide
+      AllocateSSADefData(mir, is_vector_type_wide ? 2 : 1);
+      HandleSSADef(mir->ssa_rep->defs, d_insn.vA, 0);
+      if (is_vector_type_wide == true) {
+        HandleSSADef(mir->ssa_rep->defs, d_insn.vA + 1, 1);
+      }
+      break;
+    case kMirOpPackedSet:
+      // We have one use, plus one more for wide
+      AllocateSSAUseData(mir, is_vector_type_wide ? 2 : 1);
+      HandleSSAUse(mir->ssa_rep->uses, d_insn.vB, 0);
+      if (is_vector_type_wide == true) {
+        HandleSSAUse(mir->ssa_rep->uses, d_insn.vB + 1, 1);
+      }
+      break;
+    case kMirOpSelect:
+      if (d_insn.arg[1] == 1) {
+        AllocateSSAUseData(mir, 1);
+        HandleSSAUse(mir->ssa_rep->uses, d_insn.arg[0], 0);
+      } else {
+        AllocateSSAUseData(mir, 3);
+        HandleSSAUse(mir->ssa_rep->uses, d_insn.arg[0], 0);
+        HandleSSAUse(mir->ssa_rep->uses, d_insn.vB, 1);
+        HandleSSAUse(mir->ssa_rep->uses, d_insn.vC, 2);
+      }
+      AllocateSSADefData(mir, 1);
+      HandleSSADef(mir->ssa_rep->defs, d_insn.vA, 0);
+      break;
     default:
       LOG(ERROR) << "Missing case for extended MIR: " << mir->dalvikInsn.opcode;
       break;
@@ -1085,7 +1182,7 @@ bool MIRGraph::DoSSAConversion(BasicBlock* bb) {
 
       // If not a pseudo-op, note non-leaf or can throw
     if (!MIR::DecodedInstruction::IsPseudoMirOp(mir->dalvikInsn.opcode)) {
-      int flags = Instruction::FlagsOf(mir->dalvikInsn.opcode);
+      int flags = mir->dalvikInsn.FlagsOf();
 
       if ((flags & Instruction::kInvoke) != 0 && (mir->optimization_flags & MIR_INLINED) == 0) {
         attributes_ &= ~METHOD_IS_LEAF;
@@ -1188,34 +1285,64 @@ bool MIRGraph::DoSSAConversion(BasicBlock* bb) {
    * predecessor blocks.
    */
   bb->data_flow_info->vreg_to_ssa_map_exit =
-      static_cast<int*>(arena_->Alloc(sizeof(int) * cu_->num_dalvik_registers,
+      static_cast<int*>(arena_->Alloc(sizeof(int) * GetNumOfCodeAndTempVRs(),
                                       kArenaAllocDFInfo));
 
   memcpy(bb->data_flow_info->vreg_to_ssa_map_exit, vreg_to_ssa_map_,
-         sizeof(int) * cu_->num_dalvik_registers);
+         sizeof(int) * GetNumOfCodeAndTempVRs());
   return true;
+}
+
+void MIRGraph::InitializeBasicBlockDataFlow() {
+  /*
+   * Allocate the BasicBlockDataFlow structure for the entry and code blocks.
+   */
+  for (BasicBlock* bb : block_list_) {
+    // Hidden blocks do not need handled since they are not visible.
+    if (bb->hidden == true) {
+      continue;
+    }
+
+    // Algorithms like GC map calculator need all DF calculated.
+    bool should_calculate_all_blocks = NeedGcMapRecalculation();
+
+    if (bb->block_type == kDalvikByteCode ||
+        bb->block_type == kEntryBlock ||
+        bb->block_type == kExitBlock ||
+        should_calculate_all_blocks) {
+      size_t df_info_size = sizeof(BasicBlockDataFlow);
+      if (bb->data_flow_info == nullptr) {
+        bb->data_flow_info =
+            static_cast<BasicBlockDataFlow*>(arena_->Alloc(df_info_size,
+                                                           kArenaAllocDFInfo));
+      } else {
+        // Instead of reallocating, just clear it out.
+        memset(bb->data_flow_info, 0, df_info_size);
+      }
+    }
+  }
 }
 
 /* Setup the basic data structures for SSA conversion */
 void MIRGraph::CompilerInitializeSSAConversion() {
-  size_t num_dalvik_reg = cu_->num_dalvik_registers;
+  size_t num_reg = GetNumOfCodeAndTempVRs();
 
-  ssa_base_vregs_ = new (arena_) GrowableArray<int>(arena_, num_dalvik_reg + GetDefCount() + 128,
+  ssa_base_vregs_ = new (arena_) GrowableArray<int>(arena_, num_reg + GetDefCount() + 128,
                                                     kGrowableArraySSAtoDalvikMap);
-  ssa_subscripts_ = new (arena_) GrowableArray<int>(arena_, num_dalvik_reg + GetDefCount() + 128,
+  ssa_subscripts_ = new (arena_) GrowableArray<int>(arena_, num_reg + GetDefCount() + 128,
                                                     kGrowableArraySSAtoDalvikMap);
   /*
    * Initial number of SSA registers is equal to the number of Dalvik
    * registers.
    */
-  SetNumSSARegs(num_dalvik_reg);
+  SetNumSSARegs(num_reg);
 
   /*
-   * Initialize the SSA2Dalvik map list. For the first num_dalvik_reg elements,
+   * Initialize the SSA2Dalvik map list. For the first num_reg elements,
    * the subscript is 0 so we use the ENCODE_REG_SUB macro to encode the value
    * into "(0 << 16) | i"
    */
-  for (unsigned int i = 0; i < num_dalvik_reg; i++) {
+  for (unsigned int i = 0; i < num_reg; i++) {
     ssa_base_vregs_->Insert(i);
     ssa_subscripts_->Insert(0);
   }
@@ -1225,20 +1352,22 @@ void MIRGraph::CompilerInitializeSSAConversion() {
    * Dalvik register, and the SSA names for those are the same.
    */
   vreg_to_ssa_map_ =
-      static_cast<int*>(arena_->Alloc(sizeof(int) * num_dalvik_reg,
+      static_cast<int*>(arena_->Alloc(sizeof(int) * num_reg,
                                       kArenaAllocDFInfo));
   /* Keep track of the higest def for each dalvik reg */
   ssa_last_defs_ =
-      static_cast<int*>(arena_->Alloc(sizeof(int) * num_dalvik_reg,
+      static_cast<int*>(arena_->Alloc(sizeof(int) * num_reg,
                                       kArenaAllocDFInfo));
 
-  for (unsigned int i = 0; i < num_dalvik_reg; i++) {
+  for (unsigned int i = 0; i < num_reg; i++) {
     vreg_to_ssa_map_[i] = i;
     ssa_last_defs_[i] = 0;
   }
 
   // Create a compiler temporary for Method*. This is done after SSA initialization.
-  GetNewCompilerTemp(kCompilerTempSpecialMethodPtr, false);
+  CompilerTemp* method_temp = GetNewCompilerTemp(kCompilerTempSpecialMethodPtr, false);
+  // The MIR graph keeps track of the sreg for method pointer specially, so record that now.
+  method_sreg_ = method_temp->s_reg_low;
 
   /*
    * Allocate the BasicBlockDataFlow structure for the entry and code blocks
@@ -1257,56 +1386,7 @@ void MIRGraph::CompilerInitializeSSAConversion() {
                                                          kArenaAllocDFInfo));
       }
   }
-}
-
-/*
- * This function will make a best guess at whether the invoke will
- * end up using Method*.  It isn't critical to get it exactly right,
- * and attempting to do would involve more complexity than it's
- * worth.
- */
-bool MIRGraph::InvokeUsesMethodStar(MIR* mir) {
-  InvokeType type;
-  Instruction::Code opcode = mir->dalvikInsn.opcode;
-  switch (opcode) {
-    case Instruction::INVOKE_STATIC:
-    case Instruction::INVOKE_STATIC_RANGE:
-      type = kStatic;
-      break;
-    case Instruction::INVOKE_DIRECT:
-    case Instruction::INVOKE_DIRECT_RANGE:
-      type = kDirect;
-      break;
-    case Instruction::INVOKE_VIRTUAL:
-    case Instruction::INVOKE_VIRTUAL_RANGE:
-      type = kVirtual;
-      break;
-    case Instruction::INVOKE_INTERFACE:
-    case Instruction::INVOKE_INTERFACE_RANGE:
-      return false;
-    case Instruction::INVOKE_SUPER_RANGE:
-    case Instruction::INVOKE_SUPER:
-      type = kSuper;
-      break;
-    default:
-      LOG(WARNING) << "Unexpected invoke op: " << opcode;
-      return false;
-  }
-  DexCompilationUnit m_unit(cu_);
-  MethodReference target_method(cu_->dex_file, mir->dalvikInsn.vB);
-  int vtable_idx;
-  uintptr_t direct_code;
-  uintptr_t direct_method;
-  uint32_t current_offset = static_cast<uint32_t>(current_offset_);
-  bool fast_path =
-      cu_->compiler_driver->ComputeInvokeInfo(&m_unit, current_offset,
-                                              false, true,
-                                              &type, &target_method,
-                                              &vtable_idx,
-                                              &direct_code, &direct_method) &&
-                                              !(cu_->enable_debug & (1 << kDebugSlowInvokePath));
-  return (((type == kDirect) || (type == kStatic)) &&
-          fast_path && ((direct_code == 0) || (direct_method == 0)));
+  InitializeBasicBlockDataFlow();
 }
 
 /*

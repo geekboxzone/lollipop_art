@@ -44,6 +44,10 @@ class GrowableArray {
   public:
     class Iterator {
       public:
+        explicit Iterator(GrowableArray* g_list, size_t idx)
+          : idx_(idx),
+            g_list_(g_list) {}
+
         explicit Iterator(GrowableArray* g_list)
           : idx_(0),
             g_list_(g_list) {}
@@ -74,6 +78,24 @@ class GrowableArray {
 
         size_t GetIndex() const {
           return idx_;
+        }
+
+        T operator*() {
+          DCHECK(g_list_ != nullptr);
+          if (idx_ >= g_list_->Size()) {
+            return 0;
+          } else {
+            return g_list_->Get(idx_);
+          }
+        }
+
+        bool operator!= (const Iterator& other) const {
+          return idx_ != other.idx_;
+        }
+
+        const Iterator& operator++ () {
+          Next();
+          return *this;
         }
 
       private:
@@ -203,6 +225,14 @@ class GrowableArray {
       return arena->Alloc(sizeof(GrowableArray<T>), kArenaAllocGrowableArray);
     };
     static void operator delete(void* p) {}  // Nop.
+
+    Iterator begin() {
+        return Iterator(this);
+    }
+
+    Iterator end() {
+        return Iterator(this, Size());
+    }
 
   private:
     ArenaAllocator* const arena_;

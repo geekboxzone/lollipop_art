@@ -557,6 +557,11 @@ struct FreeDelete {
 template <typename T>
 using UniqueCPtr = std::unique_ptr<T, FreeDelete>;
 
+void PushWord(std::vector<uint8_t>* buf, int32_t data);
+
+void EncodeUnsignedLeb128(uint32_t data, std::vector<uint8_t>* buf);
+void EncodeSignedLeb128(int32_t data, std::vector<uint8_t>* buf);
+
 }  // namespace art
 
 #endif  // ART_RUNTIME_UTILS_H_

@@ -48,6 +48,7 @@ LIBART_COMPILER_SRC_FILES := \
 	dex/quick/mips/target_mips.cc \
 	dex/quick/mips/utility_mips.cc \
 	dex/quick/mir_to_lir.cc \
+	dex/quick/quick_compiler.cc \
 	dex/quick/ralloc_util.cc \
 	dex/quick/resource_mask.cc \
 	dex/quick/x86/assemble_x86.cc \
@@ -62,17 +63,20 @@ LIBART_COMPILER_SRC_FILES := \
 	dex/mir_method_info.cc \
 	dex/mir_optimization.cc \
 	dex/bb_optimizations.cc \
+	dex/compiler_ir.cc \
 	dex/post_opt_passes.cc \
 	dex/pass_driver_me_opts.cc \
 	dex/pass_driver_me_post_opt.cc \
 	dex/frontend.cc \
 	dex/mir_graph.cc \
 	dex/mir_analysis.cc \
+	dex/reference_map_calculator.cc \
 	dex/verified_method.cc \
 	dex/verification_results.cc \
 	dex/vreg_analysis.cc \
 	dex/ssa_transformation.cc \
 	dex/quick_compiler_callbacks.cc \
+	dex/selectivity.cc \
 	driver/compiler_driver.cc \
 	driver/dex_compilation_unit.cc \
 	jni/quick/arm/calling_convention_arm.cc \
@@ -82,6 +86,7 @@ LIBART_COMPILER_SRC_FILES := \
 	jni/quick/x86_64/calling_convention_x86_64.cc \
 	jni/quick/calling_convention.cc \
 	jni/quick/jni_compiler.cc \
+	llvm/llvm_compiler.cc \
 	optimizing/builder.cc \
 	optimizing/code_generator.cc \
 	optimizing/code_generator_arm.cc \
@@ -107,6 +112,7 @@ LIBART_COMPILER_SRC_FILES := \
 	utils/arm64/assembler_arm64.cc \
 	utils/arm64/managed_register_arm64.cc \
 	utils/assembler.cc \
+	utils/dwarf_cfi.cc \
 	utils/mips/assembler_mips.cc \
 	utils/mips/managed_register_mips.cc \
 	utils/x86/assembler_x86.cc \
@@ -116,7 +122,6 @@ LIBART_COMPILER_SRC_FILES := \
 	utils/scoped_arena_allocator.cc \
 	utils/swap_space.cc \
 	buffered_output_stream.cc \
-	compilers.cc \
 	compiler.cc \
 	elf_fixup.cc \
 	elf_patcher.cc \
@@ -126,6 +131,7 @@ LIBART_COMPILER_SRC_FILES := \
 	file_output_stream.cc \
 	image_writer.cc \
 	oat_writer.cc \
+	plugin_handler.cc \
 	vector_output_stream.cc
 
 ifeq ($(ART_SEA_IR_MODE),true)
@@ -160,6 +166,12 @@ LIBART_COMPILER_SRC_FILES += \
 LIBART_COMPILER_CFLAGS += -DART_USE_PORTABLE_COMPILER=1
 endif
 
+# Add support for Linear Scan Register Allocator
+LSRA := false
+ifeq ($(LSRA),true)
+  LIBART_COMPILER_CFLAGS += -DLSRA
+endif
+
 LIBART_COMPILER_ENUM_OPERATOR_OUT_HEADER_FILES := \
 	dex/compiler_enums.h
 
@@ -181,6 +193,8 @@ define build-libart-compiler
   art_ndebug_or_debug := $(2)
 
   include $(CLEAR_VARS)
+  LOCAL_LDFLAGS += -Wl,-ldl
+
   ifeq ($$(art_target_or_host),host)
     LOCAL_IS_HOST_MODULE := true
   endif
@@ -209,6 +223,17 @@ $$(ENUM_OPERATOR_OUT_GEN): $$(GENERATED_SRC_DIR)/%_operator_out.cc : $(LOCAL_PAT
 	$$(transform-generated-source)
 
   LOCAL_GENERATED_SOURCES += $$(ENUM_OPERATOR_OUT_GEN)
+
+  GENERATED_SRC_DIR := $$(call local-generated-sources-dir)
+  SHA_VERSION := $$(GENERATED_SRC_DIR)/sha_version.h
+
+$$(SHA_VERSION): PRIVATE_CUSTOM_TOOL = art/tools/gen_sha.py -p art -o $$@
+$$(SHA_VERSION):
+	rm -f art/compiler/sha_version.h
+	$$(transform-generated-source)
+.PHONY: $$(SHA_VERSION)
+
+  LOCAL_GENERATED_SOURCES += $$(SHA_VERSION)
 
   LOCAL_CFLAGS := $$(LIBART_COMPILER_CFLAGS)
   include external/libcxx/libcxx.mk

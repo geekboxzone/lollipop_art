@@ -32,7 +32,45 @@
 #include "llvm/llvm_compilation_unit.h"
 #include "safe_map.h"
 
+namespace llvm {
+  class Module;
+  class LLVMContext;
+}
+
 namespace art {
+
+namespace llvm {
+  class IntrinsicHelper;
+  class IRBuilder;
+}
+
+class LLVMInfo {
+  public:
+    LLVMInfo();
+    ~LLVMInfo();
+
+    ::llvm::LLVMContext* GetLLVMContext() {
+      return llvm_context_.get();
+    }
+
+    ::llvm::Module* GetLLVMModule() {
+      return llvm_module_;
+    }
+
+    art::llvm::IntrinsicHelper* GetIntrinsicHelper() {
+      return intrinsic_helper_.get();
+    }
+
+    art::llvm::IRBuilder* GetIRBuilder() {
+      return ir_builder_.get();
+    }
+
+  private:
+    std::unique_ptr< ::llvm::LLVMContext> llvm_context_;
+    ::llvm::Module* llvm_module_;  // Managed by context_.
+    std::unique_ptr<art::llvm::IntrinsicHelper> intrinsic_helper_;
+    std::unique_ptr<art::llvm::IRBuilder> ir_builder_;
+};
 
 struct BasicBlock;
 struct CallInfo;
@@ -91,9 +129,9 @@ class MirConverter : public Backend {
     ::llvm::Type* LlvmTypeFromLocRec(RegLocation loc);
     void InitIR();
     ::llvm::BasicBlock* FindCaseTarget(uint32_t vaddr);
-    void ConvertPackedSwitch(BasicBlock* bb, int32_t table_offset,
+    void ConvertPackedSwitch(BasicBlock* bb, MIR* mir, int32_t table_offset,
                              RegLocation rl_src);
-    void ConvertSparseSwitch(BasicBlock* bb, int32_t table_offset,
+    void ConvertSparseSwitch(BasicBlock* bb, MIR* mir, int32_t table_offset,
                              RegLocation rl_src);
     void ConvertSget(int32_t field_index,
                      art::llvm::IntrinsicHelper::IntrinsicId id, RegLocation rl_dest);

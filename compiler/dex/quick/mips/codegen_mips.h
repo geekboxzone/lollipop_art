@@ -18,6 +18,7 @@
 #define ART_COMPILER_DEX_QUICK_MIPS_CODEGEN_MIPS_H_
 
 #include "dex/compiler_internals.h"
+#include "dex/quick/mir_to_lir.h"
 #include "mips_lir.h"
 
 namespace art {
@@ -85,13 +86,13 @@ class MipsMir2Lir FINAL : public Mir2Lir {
 
     // Required for target - Dalvik-level generators.
     void GenArithImmOpLong(Instruction::Code opcode, RegLocation rl_dest,
-                           RegLocation rl_src1, RegLocation rl_src2);
+                           RegLocation rl_src1, RegLocation rl_src2, int flags);
     void GenArrayGet(int opt_flags, OpSize size, RegLocation rl_array,
                      RegLocation rl_index, RegLocation rl_dest, int scale);
     void GenArrayPut(int opt_flags, OpSize size, RegLocation rl_array,
                      RegLocation rl_index, RegLocation rl_src, int scale, bool card_mark);
     void GenShiftImmOpLong(Instruction::Code opcode, RegLocation rl_dest, RegLocation rl_src1,
-                           RegLocation rl_shift);
+                           RegLocation rl_shift, int flags);
     void GenArithOpDouble(Instruction::Code opcode, RegLocation rl_dest, RegLocation rl_src1,
                           RegLocation rl_src2);
     void GenArithOpFloat(Instruction::Code opcode, RegLocation rl_dest, RegLocation rl_src1,
@@ -107,7 +108,7 @@ class MipsMir2Lir FINAL : public Mir2Lir {
     bool GenInlinedPeek(CallInfo* info, OpSize size);
     bool GenInlinedPoke(CallInfo* info, OpSize size);
     void GenArithOpLong(Instruction::Code opcode, RegLocation rl_dest, RegLocation rl_src1,
-                        RegLocation rl_src2) OVERRIDE;
+                        RegLocation rl_src2, int flags) OVERRIDE;
     RegLocation GenDivRem(RegLocation rl_dest, RegStorage reg_lo, RegStorage reg_hi, bool is_div);
     RegLocation GenDivRemLit(RegLocation rl_dest, RegStorage reg_lo, int lit, bool is_div);
     void GenCmpLong(RegLocation rl_dest, RegLocation rl_src1, RegLocation rl_src2);
@@ -115,7 +116,7 @@ class MipsMir2Lir FINAL : public Mir2Lir {
     void GenEntrySequence(RegLocation* ArgLocs, RegLocation rl_method);
     void GenExitSequence();
     void GenSpecialExitSequence();
-    void GenFillArrayData(uint32_t table_offset, RegLocation rl_src);
+    void GenFillArrayData(MIR* mir, DexOffset table_offset, RegLocation rl_src);
     void GenFusedFPCmpBranch(BasicBlock* bb, MIR* mir, bool gt_bias, bool is_double);
     void GenFusedLongCmpBranch(BasicBlock* bb, MIR* mir);
     void GenSelect(BasicBlock* bb, MIR* mir);
@@ -190,8 +191,8 @@ class MipsMir2Lir FINAL : public Mir2Lir {
 
     void ConvertShortToLongBranch(LIR* lir);
     RegLocation GenDivRem(RegLocation rl_dest, RegLocation rl_src1,
-                          RegLocation rl_src2, bool is_div, bool check_zero);
-    RegLocation GenDivRemLit(RegLocation rl_dest, RegLocation rl_src1, int lit, bool is_div);
+                          RegLocation rl_src2, bool is_div, int flags) OVERRIDE;
+    RegLocation GenDivRemLit(RegLocation rl_dest, RegLocation rl_src1, int lit, bool is_div) OVERRIDE;
 };
 
 }  // namespace art

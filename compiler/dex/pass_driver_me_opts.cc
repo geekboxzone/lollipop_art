@@ -20,8 +20,13 @@
 #include "dataflow_iterator.h"
 #include "dataflow_iterator-inl.h"
 #include "pass_driver_me_opts.h"
+#include "post_opt_passes.h"
+#include "reference_map_calculator.h"
 
 namespace art {
+
+template<>
+void (*PassDriver<PassDriverMEOpts>::special_pass_driver_selection_)(PassDriver*, CompilationUnit*) = nullptr;
 
 /*
  * Create the pass list. These passes are immutable and are shared across the threads.
@@ -37,11 +42,13 @@ const Pass* const PassDriver<PassDriverMEOpts>::g_passes[] = {
   GetPassInstance<CacheMethodLoweringInfo>(),
   GetPassInstance<SpecialMethodInliner>(),
   GetPassInstance<CodeLayout>(),
-  GetPassInstance<NullCheckEliminationAndTypeInference>(),
+  GetPassInstance<NullCheckElimination>(),
+  GetPassInstance<TypeInference>(),
   GetPassInstance<ClassInitCheckElimination>(),
   GetPassInstance<GlobalValueNumberingPass>(),
   GetPassInstance<BBCombine>(),
   GetPassInstance<BBOptimizations>(),
+  GetPassInstance<ReferenceMapCalculator>(),
 };
 
 // The number of the passes in the initial list of Passes (g_passes).
@@ -69,20 +76,30 @@ std::string PassDriver<PassDriverMEOpts>::print_pass_list_ = std::string();
 template<>
 bool PassDriver<PassDriverMEOpts>::default_print_passes_ = false;
 
-void PassDriverMEOpts::ApplyPass(PassDataHolder* data, const Pass* pass) {
-  // First call the base class' version.
-  PassDriver::ApplyPass(data, pass);
+// By default, there are no overridden pass settings.
+template<>
+std::string PassDriver<PassDriverMEOpts>::overridden_pass_options_list_ = std::string();
 
+void PassDriverMEOpts::ApplyPass(PassDataHolder* data, const Pass* pass) {
   const PassME* pass_me = down_cast<const PassME*> (pass);
   DCHECK(pass_me != nullptr);
 
   PassMEDataHolder* pass_me_data_holder = down_cast<PassMEDataHolder*>(data);
 
+  // Set to dirty.
+  pass_me_data_holder->dirty = true;
+
+  // First call the base class' version.
+  PassDriver::ApplyPass(data, pass);
+
   // Now we care about flags.
   if ((pass_me->GetFlag(kOptimizationBasicBlockChange) == true) ||
       (pass_me->GetFlag(kOptimizationDefUsesChange) == true)) {
-    CompilationUnit* c_unit = pass_me_data_holder->c_unit;
-    c_unit->mir_graph.get()->CalculateBasicBlockInformation();
+    // Is it dirty at least?
+    if (pass_me_data_holder->dirty == true) {
+      CompilationUnit* c_unit = pass_me_data_holder->c_unit;
+      c_unit->mir_graph.get()->CalculateBasicBlockInformation();
+    }
   }
 }
 

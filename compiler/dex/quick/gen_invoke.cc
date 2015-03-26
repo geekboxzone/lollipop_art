@@ -383,11 +383,11 @@ void Mir2Lir::FlushIns(RegLocation* ArgLocs, RegLocation rl_method) {
     StoreRefDisp(TargetPtrReg(kSp), 0, rl_src.reg, kNotVolatile);
   }
 
-  if (cu_->num_ins == 0) {
+  if (mir_graph_->GetNumOfInVRs() == 0) {
     return;
   }
 
-  int start_vreg = cu_->num_dalvik_registers - cu_->num_ins;
+  int start_vreg = mir_graph_->GetFirstInVR();
   /*
    * Copy incoming arguments to their proper home locations.
    * NOTE: an older version of dx had an issue in which
@@ -401,7 +401,7 @@ void Mir2Lir::FlushIns(RegLocation* ArgLocs, RegLocation rl_method) {
    * half to memory as well.
    */
   ScopedMemRefType mem_ref_type(this, ResourceMask::kDalvikReg);
-  for (int i = 0; i < cu_->num_ins; i++) {
+  for (uint32_t i = 0; i < mir_graph_->GetNumOfInVRs(); i++) {
     PromotionMap* v_map = &promotion_map_[start_vreg + i];
     RegStorage reg = GetArgMappingToPhysicalReg(i);
 
@@ -936,9 +936,6 @@ int Mir2Lir::GenDalvikArgsRange(CallInfo* info, int call_state,
     }
   }
 
-  // Logic below assumes that Method pointer is at offset zero from SP.
-  DCHECK_EQ(VRegOffset(static_cast<int>(kVRegMethodPtrBaseReg)), 0);
-
   // The first 3 arguments are passed via registers.
   // TODO: For 64-bit, instead of hardcoding 4 for Method* size, we should either
   // get size of uintptr_t or size of object reference according to model being used.
@@ -1330,9 +1327,13 @@ bool Mir2Lir::GenInlinedReverseBytes(CallInfo* info, OpSize size) {
     // TODO - add Mips implementation.
     return false;
   }
+  RegLocation rl_dest = (size == k64) ? InlineTargetWide(info) : InlineTarget(info);  // result reg
+  if (rl_dest.s_reg_low == INVALID_SREG) {
+    // Result is unused, the code is dead. Inlining successful, no code generated.
+    return true;
+  }
   RegLocation rl_src_i = info->args[0];
   RegLocation rl_i = (size == k64) ? LoadValueWide(rl_src_i, kCoreReg) : LoadValue(rl_src_i, kCoreReg);
-  RegLocation rl_dest = (size == k64) ? InlineTargetWide(info) : InlineTarget(info);  // result reg
   RegLocation rl_result = EvalLoc(rl_dest, kCoreReg, true);
   if (size == k64) {
     if (cu_->instruction_set == kArm64 || cu_->instruction_set == kX86_64) {
@@ -1366,9 +1367,13 @@ bool Mir2Lir::GenInlinedAbsInt(CallInfo* info) {
     // TODO - add Mips implementation
     return false;
   }
+  RegLocation rl_dest = InlineTarget(info);
+  if (rl_dest.s_reg_low == INVALID_SREG) {
+    // Result is unused, the code is dead. Inlining successful, no code generated.
+    return true;
+  }
   RegLocation rl_src = info->args[0];
   rl_src = LoadValue(rl_src, kCoreReg);
-  RegLocation rl_dest = InlineTarget(info);
   RegLocation rl_result = EvalLoc(rl_dest, kCoreReg, true);
   RegStorage sign_reg = AllocTemp();
   // abs(x) = y<=x>>31, (x+y)^y.
@@ -1384,9 +1389,13 @@ bool Mir2Lir::GenInlinedAbsLong(CallInfo* info) {
     // TODO - add Mips implementation
     return false;
   }
+  RegLocation rl_dest = InlineTargetWide(info);
+  if (rl_dest.s_reg_low == INVALID_SREG) {
+    // Result is unused, the code is dead. Inlining successful, no code generated.
+    return true;
+  }
   RegLocation rl_src = info->args[0];
   rl_src = LoadValueWide(rl_src, kCoreReg);
-  RegLocation rl_dest = InlineTargetWide(info);
   RegLocation rl_result = EvalLoc(rl_dest, kCoreReg, true);
 
   // If on x86 or if we would clobber a register needed later, just copy the source first.
@@ -1455,8 +1464,12 @@ bool Mir2Lir::GenInlinedFloatCvt(CallInfo* info) {
     // TODO - add Mips implementation
     return false;
   }
-  RegLocation rl_src = info->args[0];
   RegLocation rl_dest = InlineTarget(info);
+  if (rl_dest.s_reg_low == INVALID_SREG) {
+    // Result is unused, the code is dead. Inlining successful, no code generated.
+    return true;
+  }
+  RegLocation rl_src = info->args[0];
   StoreValue(rl_dest, rl_src);
   return true;
 }
@@ -1466,8 +1479,12 @@ bool Mir2Lir::GenInlinedDoubleCvt(CallInfo* info) {
     // TODO - add Mips implementation
     return false;
   }
-  RegLocation rl_src = info->args[0];
   RegLocation rl_dest = InlineTargetWide(info);
+  if (rl_dest.s_reg_low == INVALID_SREG) {
+    // Result is unused, the code is dead. Inlining successful, no code generated.
+    return true;
+  }
+  RegLocation rl_src = info->args[0];
   StoreValueWide(rl_dest, rl_src);
   return true;
 }

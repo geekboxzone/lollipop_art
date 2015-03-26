@@ -137,6 +137,68 @@ define set-target-local-clang-vars
       endif)
 endef
 
+ART_TARGET_CLANG_CFLAGS :=
+ART_TARGET_CLANG_CFLAGS_arm :=
+ART_TARGET_CLANG_CFLAGS_arm64 :=
+ART_TARGET_CLANG_CFLAGS_mips :=
+ART_TARGET_CLANG_CFLAGS_x86 :=
+ART_TARGET_CLANG_CFLAGS_x86_64 :=
+
+# These are necessary for Clang ARM64 ART builds. TODO: remove.
+ART_TARGET_CLANG_CFLAGS_arm64  += \
+  -Wno-implicit-exception-spec-mismatch \
+  -DNVALGRIND \
+  -Wno-unused-value
+
+# FIXME: upstream LLVM has a vectorizer bug that needs to be fixed
+ART_TARGET_CLANG_CFLAGS_arm64 += \
+  -fno-vectorize
+
+# Colorize clang compiler warnings.
+art_clang_cflags := -fcolor-diagnostics
+
+# Warn about thread safety violations with clang.
+art_clang_cflags += -Wthread-safety
+
+# Warn if switch fallthroughs aren't annotated.
+art_clang_cflags += -Wimplicit-fallthrough
+
+# Enable float equality warnings.
+art_clang_cflags += -Wfloat-equal
+
+# Enable warning of converting ints to void*.
+art_clang_cflags += -Wint-to-void-pointer-cast
+
+# GCC-only warnings.
+art_gcc_cflags := -Wunused-but-set-parameter
+# Suggest const: too many false positives, but good for a trial run.
+#                  -Wsuggest-attribute=const
+# Useless casts: too many, as we need to be 32/64 agnostic, but the compiler knows.
+#                  -Wuseless-cast
+# Zero-as-null: Have to convert all NULL and "diagnostic ignore" all includes like libnativehelper
+# that are still stuck pre-C++11.
+#                  -Wzero-as-null-pointer-constant \
+# Suggest final: Have to move to a more recent GCC.
+#                  -Wsuggest-final-types
+
+
+ifeq ($(ART_HOST_CLANG),true)
+  # Bug: 15446488. We don't omit the frame pointer to work around
+  # clang/libunwind bugs that cause SEGVs in run-test-004-ThreadStress.
+  ART_HOST_CFLAGS += $(art_clang_cflags) -fno-omit-frame-pointer
+else
+  ART_HOST_CFLAGS += $(art_gcc_cflags)
+endif
+ifeq ($(ART_TARGET_CLANG),true)
+  ART_TARGET_CFLAGS += $(art_clang_cflags)
+else
+  ART_TARGET_CFLAGS += $(art_gcc_cflags)
+endif
+
+# Clear local variables now their use has ended.
+art_clang_cflags :=
+art_gcc_cflags :=
+
 ART_CPP_EXTENSION := .cc
 
 ART_C_INCLUDES := \
@@ -200,8 +262,8 @@ art_target_non_debug_cflags := \
 
 ifeq ($(HOST_OS),linux)
   # Larger frame-size for host clang builds today
-  art_host_non_debug_cflags += -Wframe-larger-than=3000
-  art_target_non_debug_cflags += -Wframe-larger-than=1728
+  art_host_non_debug_cflags += -Wframe-larger-than=3100
+  art_target_non_debug_cflags += -Wframe-larger-than=3100
 endif
 
 # FIXME: upstream LLVM has a vectorizer bug that needs to be fixed

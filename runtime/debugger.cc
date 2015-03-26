@@ -2389,9 +2389,7 @@ JDWP::JdwpError Dbg::SuspendThread(JDWP::ObjectId thread_id, bool request_suspen
   if (peer.get() == NULL) {
     return JDWP::ERR_THREAD_NOT_ALIVE;
   }
-  // Suspend thread to build stack trace. Take suspend thread lock to avoid races with threads
-  // trying to suspend this one.
-  MutexLock mu(self, *Locks::thread_list_suspend_thread_lock_);
+  // Suspend thread to build stack trace.
   bool timed_out;
   ThreadList* thread_list = Runtime::Current()->GetThreadList();
   Thread* thread = thread_list->SuspendThreadByPeer(peer.get(), request_suspension, true,
@@ -3364,13 +3362,9 @@ class ScopedThreadSuspension {
         soa.Self()->TransitionFromRunnableToSuspended(kWaitingForDebuggerSuspension);
         jobject thread_peer = Dbg::GetObjectRegistry()->GetJObject(thread_id);
         bool timed_out;
-        Thread* suspended_thread;
-        {
-          // Take suspend thread lock to avoid races with threads trying to suspend this one.
-          MutexLock mu(soa.Self(), *Locks::thread_list_suspend_thread_lock_);
-          ThreadList* thread_list = Runtime::Current()->GetThreadList();
-          suspended_thread = thread_list->SuspendThreadByPeer(thread_peer, true, true, &timed_out);
-        }
+        ThreadList* thread_list = Runtime::Current()->GetThreadList();
+        Thread* suspended_thread = thread_list->SuspendThreadByPeer(thread_peer, true, true,
+                                                                    &timed_out);
         CHECK_EQ(soa.Self()->TransitionFromSuspendedToRunnable(), kWaitingForDebuggerSuspension);
         if (suspended_thread == nullptr) {
           // Thread terminated from under us while suspending.
@@ -4299,6 +4293,12 @@ class HeapChunkContext {
     size_t needed = (((length/ALLOCATION_UNIT_SIZE + 255) / 256) * 2) + 17;
     size_t bytesLeft = buf_.size() - (size_t)(p_ - &buf_[0]);
     if (bytesLeft < needed) {
+#ifdef USE_DLMALLOC
+      // Cannot trigger memory allocation while walking native heap.
+      if (type_ == CHUNK_TYPE("NHSG")) {
+        return;
+      }
+#endif
       Flush();
     }
 
@@ -4424,7 +4424,9 @@ void Dbg::DdmSendHeapSegments(bool native) {
   HeapChunkContext context((what == HPSG_WHAT_MERGED_OBJECTS), native);
   if (native) {
 #ifdef USE_DLMALLOC
+    ReaderMutexLock mu(self, *Locks::heap_bitmap_lock_);
     dlmalloc_inspect_all(HeapChunkContext::HeapChunkCallback, &context);
+    HeapChunkContext::HeapChunkCallback(NULL, NULL, 0, &context);  // Indicate end of a space.
 #else
     UNIMPLEMENTED(WARNING) << "Native heap inspection is only supported with dlmalloc";
 #endif

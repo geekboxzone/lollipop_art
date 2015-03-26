@@ -323,6 +323,12 @@ void Mir2Lir::GenIntToLong(RegLocation rl_dest, RegLocation rl_src) {
   StoreValueWide(rl_dest, rl_result);
 }
 
+void Mir2Lir::GenLongToInt(RegLocation rl_dest, RegLocation rl_src) {
+  rl_src = UpdateLocWide(rl_src);
+  rl_src = NarrowRegLoc(rl_src);
+  StoreValue(rl_dest, rl_src);
+}
+
 void Mir2Lir::GenIntNarrowing(Instruction::Code opcode, RegLocation rl_dest,
                               RegLocation rl_src) {
   rl_src = LoadValue(rl_src, kCoreReg);
@@ -431,7 +437,11 @@ void Mir2Lir::GenFilledNewArray(CallInfo* info) {
       RegLocation loc = UpdateLoc(info->args[i]);
       if (loc.location == kLocPhysReg) {
         ScopedMemRefType mem_ref_type(this, ResourceMask::kDalvikReg);
-        Store32Disp(TargetPtrReg(kSp), SRegOffset(loc.s_reg_low), loc.reg);
+        if (loc.ref) {
+          StoreRefDisp(TargetPtrReg(kSp), SRegOffset(loc.s_reg_low), loc.reg, kNotVolatile);
+        } else {
+          Store32Disp(TargetPtrReg(kSp), SRegOffset(loc.s_reg_low), loc.reg);
+        }
       }
     }
     /*
@@ -487,9 +497,17 @@ void Mir2Lir::GenFilledNewArray(CallInfo* info) {
   } else if (!info->is_range) {
     // TUNING: interleave
     for (int i = 0; i < elems; i++) {
-      RegLocation rl_arg = LoadValue(info->args[i], kCoreReg);
-      Store32Disp(ref_reg,
-                  mirror::Array::DataOffset(component_size).Int32Value() + i * 4, rl_arg.reg);
+      RegLocation rl_arg;
+      if (info->args[i].ref) {
+        rl_arg = LoadValue(info->args[i], kRefReg);
+        StoreRefDisp(ref_reg,
+                    mirror::Array::DataOffset(component_size).Int32Value() + i * 4, rl_arg.reg,
+                    kNotVolatile);
+      } else {
+        rl_arg = LoadValue(info->args[i], kCoreReg);
+        Store32Disp(ref_reg,
+                    mirror::Array::DataOffset(component_size).Int32Value() + i * 4, rl_arg.reg);
+      }
       // If the LoadValue caused a temp to be allocated, free it
       if (IsTemp(rl_arg.reg)) {
         FreeTemp(rl_arg.reg);
@@ -1419,7 +1437,7 @@ void Mir2Lir::GenShiftOpLong(Instruction::Code opcode, RegLocation rl_dest,
 
 
 void Mir2Lir::GenArithOpInt(Instruction::Code opcode, RegLocation rl_dest,
-                            RegLocation rl_src1, RegLocation rl_src2) {
+                            RegLocation rl_src1, RegLocation rl_src2, int flags) {
   DCHECK(cu_->instruction_set != kX86 && cu_->instruction_set != kX86_64);
   OpKind op = kOpBkpt;
   bool is_div_rem = false;
@@ -1518,7 +1536,7 @@ void Mir2Lir::GenArithOpInt(Instruction::Code opcode, RegLocation rl_dest,
     if (cu_->instruction_set == kMips || cu_->instruction_set == kArm64) {
       rl_src1 = LoadValue(rl_src1, kCoreReg);
       rl_src2 = LoadValue(rl_src2, kCoreReg);
-      if (check_zero) {
+      if (check_zero && (flags & MIR_IGNORE_DIV_ZERO_CHECK) == 0) {
         GenDivZeroCheck(rl_src2.reg);
       }
       rl_result = GenDivRem(rl_dest, rl_src1.reg, rl_src2.reg, op == kOpDiv);
@@ -1529,7 +1547,7 @@ void Mir2Lir::GenArithOpInt(Instruction::Code opcode, RegLocation rl_dest,
         // calculate using a MUL and subtract.
         rl_src1 = LoadValue(rl_src1, kCoreReg);
         rl_src2 = LoadValue(rl_src2, kCoreReg);
-        if (check_zero) {
+        if (check_zero && (flags & MIR_IGNORE_DIV_ZERO_CHECK) == 0) {
           GenDivZeroCheck(rl_src2.reg);
         }
         rl_result = GenDivRem(rl_dest, rl_src1.reg, rl_src2.reg, op == kOpDiv);
@@ -1543,7 +1561,7 @@ void Mir2Lir::GenArithOpInt(Instruction::Code opcode, RegLocation rl_dest,
       LoadValueDirectFixed(rl_src2, TargetReg(kArg1, kNotWide));
       RegStorage r_tgt = CallHelperSetup(kQuickIdivmod);
       LoadValueDirectFixed(rl_src1, TargetReg(kArg0, kNotWide));
-      if (check_zero) {
+      if (check_zero && (flags & MIR_IGNORE_DIV_ZERO_CHECK) == 0) {
         GenDivZeroCheck(TargetReg(kArg1, kNotWide));
       }
       // NOTE: callout here is not a safepoint.
@@ -1830,7 +1848,7 @@ void Mir2Lir::GenArithOpIntLit(Instruction::Code opcode, RegLocation rl_dest, Re
 }
 
 void Mir2Lir::GenArithOpLong(Instruction::Code opcode, RegLocation rl_dest,
-                             RegLocation rl_src1, RegLocation rl_src2) {
+                             RegLocation rl_src1, RegLocation rl_src2, int flags) {
   RegLocation rl_result;
   OpKind first_op = kOpBkpt;
   OpKind second_op = kOpBkpt;
@@ -1915,7 +1933,9 @@ void Mir2Lir::GenArithOpLong(Instruction::Code opcode, RegLocation rl_dest,
       RegStorage r_tmp2 = TargetReg(kArg2, kWide);
       LoadValueDirectWideFixed(rl_src2, r_tmp2);
       RegStorage r_tgt = CallHelperSetup(target);
-      GenDivZeroCheckWide(r_tmp2);
+      if ((flags & MIR_IGNORE_DIV_ZERO_CHECK) == 0) {
+        GenDivZeroCheckWide(r_tmp2);
+      }
       LoadValueDirectWideFixed(rl_src1, r_tmp1);
       // NOTE: callout here is not a safepoint
       CallHelper(r_tgt, target, false /* not safepoint */);
@@ -2042,52 +2062,62 @@ void Mir2Lir::GenConstWide(RegLocation rl_dest, int64_t value) {
 }
 
 void Mir2Lir::GenSmallPackedSwitch(MIR* mir, DexOffset table_offset, RegLocation rl_src) {
-  const uint16_t* table = cu_->insns + current_dalvik_offset_ + table_offset;
+  BasicBlock* bb = mir_graph_->GetBasicBlock(mir->bb);
+  DCHECK(bb != nullptr);
+  GrowableArray<SuccessorBlockInfo*>::Iterator succ_bb_iter = bb->successor_blocks->begin();
+  const uint16_t* table = mir_graph_->GetTable(mir, table_offset);
   const uint16_t entries = table[1];
   // Chained cmp-and-branch.
   const int32_t* as_int32 = reinterpret_cast<const int32_t*>(&table[2]);
-  int32_t current_key = as_int32[0];
-  const int32_t* targets = &as_int32[1];
+  int32_t starting_key = as_int32[0];
   rl_src = LoadValue(rl_src, kCoreReg);
   int i = 0;
-  for (; i < entries; i++, current_key++) {
-    if (!InexpensiveConstantInt(current_key, Instruction::Code::IF_EQ)) {
+  for (; i < entries; ++i, ++succ_bb_iter) {
+    if (!InexpensiveConstantInt(starting_key + i, Instruction::Code::IF_EQ)) {
       // Switch to using a temp and add.
       break;
     }
-    BasicBlock* case_block =
-        mir_graph_->FindBlock(current_dalvik_offset_ + targets[i]);
-    OpCmpImmBranch(kCondEq, rl_src.reg, current_key, &block_label_list_[case_block->id]);
+    SuccessorBlockInfo* successor_block_info = *succ_bb_iter;
+    DCHECK(successor_block_info != nullptr);
+    int case_block_id = successor_block_info->block;
+    DCHECK_EQ(starting_key + i, successor_block_info->key);
+    OpCmpImmBranch(kCondEq, rl_src.reg, starting_key + i, &block_label_list_[case_block_id]);
   }
   if (i < entries) {
     // The rest do not seem to be inexpensive. Try to allocate a temp and use add.
     RegStorage key_temp = AllocTypedTemp(false, kCoreReg, false);
     if (key_temp.Valid()) {
-      LoadConstantNoClobber(key_temp, current_key);
-      for (; i < entries - 1; i++, current_key++) {
-        BasicBlock* case_block =
-            mir_graph_->FindBlock(current_dalvik_offset_ + targets[i]);
-        OpCmpBranch(kCondEq, rl_src.reg, key_temp, &block_label_list_[case_block->id]);
+      LoadConstantNoClobber(key_temp, starting_key + i);
+      for (; i < entries - 1; ++i, ++succ_bb_iter) {
+        SuccessorBlockInfo* successor_block_info = *succ_bb_iter;
+        DCHECK(successor_block_info != nullptr);
+        int case_block_id = successor_block_info->block;
+        DCHECK_EQ(starting_key + i, successor_block_info->key);
+        OpCmpBranch(kCondEq, rl_src.reg, key_temp, &block_label_list_[case_block_id]);
         OpRegImm(kOpAdd, key_temp, 1);  // Increment key.
       }
-      BasicBlock* case_block =
-          mir_graph_->FindBlock(current_dalvik_offset_ + targets[i]);
-      OpCmpBranch(kCondEq, rl_src.reg, key_temp, &block_label_list_[case_block->id]);
+      SuccessorBlockInfo* successor_block_info = *succ_bb_iter;
+      DCHECK(successor_block_info != nullptr);
+      int case_block_id = successor_block_info->block;
+      DCHECK_EQ(starting_key + i, successor_block_info->key);
+      OpCmpBranch(kCondEq, rl_src.reg, key_temp, &block_label_list_[case_block_id]);
     } else {
       // No free temp, just finish the old loop.
-      for (; i < entries; i++, current_key++) {
-        BasicBlock* case_block =
-            mir_graph_->FindBlock(current_dalvik_offset_ + targets[i]);
-        OpCmpImmBranch(kCondEq, rl_src.reg, current_key, &block_label_list_[case_block->id]);
+      for (; i < entries; ++i, ++succ_bb_iter) {
+        SuccessorBlockInfo* successor_block_info = *succ_bb_iter;
+        DCHECK(successor_block_info != nullptr);
+        int case_block_id = successor_block_info->block;
+        DCHECK_EQ(starting_key + i, successor_block_info->key);
+        OpCmpImmBranch(kCondEq, rl_src.reg, starting_key + i, &block_label_list_[case_block_id]);
       }
     }
   }
 }
 
 void Mir2Lir::GenPackedSwitch(MIR* mir, DexOffset table_offset, RegLocation rl_src) {
-  const uint16_t* table = cu_->insns + current_dalvik_offset_ + table_offset;
+  const uint16_t* table = mir_graph_->GetTable(mir, table_offset);
   if (cu_->verbose) {
-    DumpSparseSwitchTable(table);
+    DumpPackedSwitchTable(table);
   }
 
   const uint16_t entries = table[1];
@@ -2100,22 +2130,24 @@ void Mir2Lir::GenPackedSwitch(MIR* mir, DexOffset table_offset, RegLocation rl_s
 }
 
 void Mir2Lir::GenSmallSparseSwitch(MIR* mir, DexOffset table_offset, RegLocation rl_src) {
-  const uint16_t* table = cu_->insns + current_dalvik_offset_ + table_offset;
+  BasicBlock* bb = mir_graph_->GetBasicBlock(mir->bb);
+  DCHECK(bb != nullptr);
+  const uint16_t* table = mir_graph_->GetTable(mir, table_offset);
   const uint16_t entries = table[1];
   // Chained cmp-and-branch.
-  const int32_t* keys = reinterpret_cast<const int32_t*>(&table[2]);
-  const int32_t* targets = &keys[entries];
   rl_src = LoadValue(rl_src, kCoreReg);
-  for (int i = 0; i < entries; i++) {
-    int key = keys[i];
-    BasicBlock* case_block =
-        mir_graph_->FindBlock(current_dalvik_offset_ + targets[i]);
-    OpCmpImmBranch(kCondEq, rl_src.reg, key, &block_label_list_[case_block->id]);
+  int i = 0;
+  for (SuccessorBlockInfo* successor_block_info : *(bb->successor_blocks)) {
+    int case_block_id = successor_block_info->block;
+    int key = successor_block_info->key;
+    OpCmpImmBranch(kCondEq, rl_src.reg, key, &block_label_list_[case_block_id]);
+    i++;
   }
+  DCHECK_EQ(i, entries);
 }
 
 void Mir2Lir::GenSparseSwitch(MIR* mir, DexOffset table_offset, RegLocation rl_src) {
-  const uint16_t* table = cu_->insns + current_dalvik_offset_ + table_offset;
+  const uint16_t* table = mir_graph_->GetTable(mir, table_offset);
   if (cu_->verbose) {
     DumpSparseSwitchTable(table);
   }
