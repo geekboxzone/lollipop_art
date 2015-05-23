@@ -26,6 +26,8 @@
 
 #include "sigchain.h"
 
+#define ATTRIBUTE_UNUSED __attribute__ ((__unused__))
+
 static void log(const char* format, ...) {
   char buf[256];
   va_list ap;
@@ -63,3 +65,12 @@ extern "C" void InitializeSignalChain() {
   log("InitializeSignalChain is not exported by the main executable.");
   abort();
 }
+
+extern "C" void SetSpecialSignalHandlerFn(int signal ATTRIBUTE_UNUSED,
+                                          SpecialSignalHandlerFn fn ATTRIBUTE_UNUSED) {
+  log("SetSpecialSignalHandlerFn is not exported by the main executable.");
+  abort();
+}
+
+//#pragma GCC diagnostic pop
+

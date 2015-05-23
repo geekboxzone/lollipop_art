@@ -16,12 +16,15 @@
 
 #include "native_bridge_art_interface.h"
 
+#include <signal.h>
+
 #include "nativebridge/native_bridge.h"
 
 #include "base/logging.h"
 #include "mirror/art_method-inl.h"
 #include "mirror/class-inl.h"
 #include "scoped_thread_state_change.h"
+#include "sigchain.h"
 
 namespace art {
 
@@ -125,7 +128,19 @@ void PreInitializeNativeBridge(std::string dir) {
 }
 
 void InitializeNativeBridge(JNIEnv* env, const char* instruction_set) {
-  android::InitializeNativeBridge(env, instruction_set);
+  if (android::InitializeNativeBridge(env, instruction_set)) {
+    if (android::NativeBridgeGetVersion() >= 2U) {
+#ifdef _NSIG  // Undefined on Apple, but we don't support running on Mac, anyways.
+      // Managed signal handling support added in version 2.
+      for (int signal = 0; signal < _NSIG; ++signal) {
+        android::NativeBridgeSignalHandlerFn fn = android::NativeBridgeGetSignalHandler(signal);
+        if (fn != nullptr) {
+          SetSpecialSignalHandlerFn(signal, fn);
+        }
+      }
+#endif
+    }
+  }
 }
 
 void UnloadNativeBridge() {

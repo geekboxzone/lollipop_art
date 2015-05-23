@@ -27,6 +27,9 @@ extern "C" void EnsureFrontOfChain(int signal, struct sigaction* expected_action
 
 extern "C" void UnclaimSignalChain(int signal);
 
+typedef bool (*SpecialSignalHandlerFn)(int, siginfo_t*, void*);
+extern "C" void SetSpecialSignalHandlerFn(int signal, SpecialSignalHandlerFn fn);
+
 extern "C" void InvokeUserSignalHandler(int sig, siginfo_t* info, void* context);
 
 #endif  // ART_SIGCHAINLIB_SIGCHAIN_H_
