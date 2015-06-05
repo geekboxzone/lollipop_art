@@ -122,6 +122,10 @@ class Runtime {
     return is_zygote_;
   }
 
+  bool IsCheckBoot() const {
+    return check_boot_;
+  }
+
   bool IsExplicitGcDisabled() const {
     return is_explicit_gc_disabled_;
   }
@@ -537,6 +541,7 @@ class Runtime {
 
   CompilerCallbacks* compiler_callbacks_;
   bool is_zygote_;
+  bool check_boot_;
   bool must_relocate_;
   bool is_concurrent_gc_enabled_;
   bool is_explicit_gc_disabled_;

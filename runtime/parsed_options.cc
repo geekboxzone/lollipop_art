@@ -227,6 +227,7 @@ bool ParsedOptions::Parse(const RuntimeOptions& options, bool ignore_unrecognize
 
   compiler_callbacks_ = nullptr;
   is_zygote_ = false;
+  check_boot_ = true;
   must_relocate_ = kDefaultMustRelocate;
   dex2oat_enabled_ = true;
   image_dex2oat_enabled_ = true;
@@ -309,6 +310,8 @@ bool ParsedOptions::Parse(const RuntimeOptions& options, bool ignore_unrecognize
       }
     } else if (StartsWith(option, "-Xcheck:jni")) {
       check_jni_ = true;
+    } else if (StartsWith(option, "-Xcheckboot")) {
+      check_boot_ = false;
     } else if (StartsWith(option, "-Xrunjdwp:") || StartsWith(option, "-agentlib:jdwp=")) {
       std::string tail(option.substr(option[1] == 'X' ? 10 : 15));
       // TODO: move parsing logic out of Dbg

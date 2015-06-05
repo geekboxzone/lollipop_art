@@ -448,7 +448,7 @@ ImageSpace* ImageSpace::Create(const char* image_location,
                                              &has_system, &cache_filename, &dalvik_cache_exists,
                                              &has_cache, &is_global_cache);
 
-  if (Runtime::Current()->IsZygote()) {
+  if (Runtime::Current()->IsZygote() && Runtime::Current()->IsCheckBoot()) {
     MarkZygoteStart(image_isa);
   }
 
