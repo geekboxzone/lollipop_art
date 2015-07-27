@@ -165,6 +165,9 @@ class RegTypeCache {
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static void CreatePrimitiveAndSmallConstantTypes() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
+  // Guards adding and visitng roots to prevent race conditions.
+  Mutex entries_lock_ DEFAULT_MUTEX_ACQUIRED_AFTER;
+
   // The actual storage for the RegTypes.
   std::vector<RegType*> entries_;
 
